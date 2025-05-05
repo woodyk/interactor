@@ -1,0 +1,4 @@
+aiohttp
+openai
+rich
+tiktoken
