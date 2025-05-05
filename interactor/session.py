@@ -5,7 +5,7 @@
 # Description: EchoAI session manager with full CRUD and branching
 # Author: Ms. White
 # Created: 2025-05-02
-# Modified: 2025-05-05 17:56:07
+# Modified: 2025-05-05 18:10:55
 
 import os
 import json
@@ -27,7 +27,7 @@ class Session:
             ValueError: If directory is None or not a string.
             OSError: If the directory cannot be created or accessed.
         """
-        if not directory or not isinstance(directory, str):
+        if not directory:
             raise ValueError("Session directory must be a valid non-empty string path.")
 
         try:
