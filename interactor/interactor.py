@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-11 22:41:08
+# Modified: 2025-05-11 23:38:58
 
 import os
 import re
@@ -90,6 +90,7 @@ class Interactor:
         Raises:
             ValueError: If provider is not supported or API key is missing for non-Ollama providers.
         """
+        self.system = "You are a helpful Assistant."
         self.logger = logging.getLogger(f"InteractorLogger_{id(self)}")
         self.logger.setLevel(logging.DEBUG)
 
@@ -181,10 +182,10 @@ class Interactor:
             model = "openai:gpt-4o-mini"
 
         # Initialize model + encoding
-        self.system = self.messages_system("You are a helpful Assistant.")
         self._setup_client(model, base_url, api_key)
         self.tools_enabled = self.tools_supported if tools is None else tools and self.tools_supported
         self._setup_encoding()
+        self.messages_add(role="system", content=self.system)
 
     def _log(self, message: str, level: str = "info"):
         if self._log_enabled:
@@ -823,8 +824,8 @@ class Interactor:
             self.session_id = session_id
             self.session_load(session_id)
 
-        # Add user message using message_add
-        self.message_add(role="user", content=user_input)
+        # Add user message using messages_add
+        self.messages_add(role="user", content=user_input)
 
         # Log token count estimate
         token_count = self._count_tokens(self.history)
@@ -921,7 +922,7 @@ class Interactor:
                         }
                         
                         # Add the assistant message with tool call
-                        self.message_add(
+                        self.messages_add(
                             role="assistant", 
                             content=content if len(tool_calls) == 1 else "",
                             tool_info=tool_info
@@ -944,18 +945,14 @@ class Interactor:
                             "result": result
                         }
                         
-                        self.message_add(
+                        self.messages_add(
                             role="tool",
                             content=result,
                             tool_info=tool_result_info
                         )
-                        
-                        # If we're streaming, indicate waiting for response
-                        if stream and not quiet:
-                            print("\nWaiting for model to process tool results...")
                 else:
                     # Simple assistant response without tool calls
-                    self.message_add(role="assistant", content=content)
+                    self.messages_add(role="assistant", content=content)
                     break  # No more tools to process, we're done
                 
                 # Reset live display if needed
@@ -1296,7 +1293,7 @@ class Interactor:
             live_was_active = True
             live.stop()
 
-        print(f"Running {function_name}...\n")
+        print(f"\nRunning {function_name}...\n")
 
         if output_callback:
             notification = json.dumps({
@@ -1793,7 +1790,7 @@ class Interactor:
         return final_token_count > self.context_length or len(self.history) == len(system_indices)
 
 
-    def message_add(
+    def messages_add(
         self,
         role: str,
         content: Any,
@@ -1879,14 +1876,31 @@ class Interactor:
         if not isinstance(prompt, str) or not prompt:
             return self.system
 
+        # If the prompt hasn't changed, don't do anything
+        if self.system == prompt:
+            return self.system
+
+        # Update the system prompt
+        old_system = self.system
         self.system = prompt
 
-        # Inject system prompt into history if using OpenAI
+        # For OpenAI, update or insert the system message in history
         if self.sdk == "openai":
-            self.history.insert(0, {"role": "system", "content": prompt})
+            # Check if there's already a system message
+            system_index = next((i for i, msg in enumerate(self.history)
+                                if msg.get("role") == "system"), None)
 
-        # Always log it to session
-        if self.session_enabled and self.session_id:
+            if system_index is not None:
+                # Update existing system message
+                self.history[system_index]["content"] = prompt
+            else:
+                # Insert new system message at the beginning
+                self.history.insert(0, {"role": "system", "content": prompt})
+
+        # For Anthropic, system message is not part of history, just save it for API calls
+
+        # Log to session only if prompt actually changed
+        if self.session_enabled and self.session_id and old_system != prompt:
             self.session.msg_insert(self.session_id, {"role": "system", "content": prompt})
 
         return self.system
@@ -1895,7 +1909,7 @@ class Interactor:
         """Return full session messages (persisted or in-memory)."""
         if self.session_enabled and self.session_id:
             return self.session.load_full(self.session_id).get("messages", [])
-        return self.history
+        return self.session_history
 
     def messages_length(self) -> int:
         """Calculate the total token count for the message history."""
@@ -1927,12 +1941,27 @@ class Interactor:
                 # Convert session format to our standard format
                 self.session_history = []
                 
+                # Track the most recent system message
+                latest_system_msg = None
+                
                 for msg in messages:
                     # Extract fields
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
                     msg_id = msg.get("id", str(uuid.uuid4()))
                     timestamp = msg.get("timestamp", datetime.now(timezone.utc).isoformat())
+                    
+                    # If this is a system message, track it but don't add to session_history yet
+                    if role == "system":
+                        if latest_system_msg is None or timestamp > latest_system_msg["timestamp"]:
+                            latest_system_msg = {
+                                "role": role,
+                                "content": content,
+                                "id": msg_id,
+                                "timestamp": timestamp,
+                                "metadata": {"sdk": self.sdk}
+                            }
+                        continue
                     
                     # Build tool_info if present
                     tool_info = None
@@ -1958,10 +1987,15 @@ class Interactor:
                         standard_msg["metadata"]["tool_info"] = tool_info
                     
                     self.session_history.append(standard_msg)
-                    
-                    # Set system prompt if found
-                    if role == "system":
-                        self.system = content
+                
+                # If we found a system message, update the system property and add to history
+                if latest_system_msg:
+                    self.system = latest_system_msg["content"]
+                    # Insert at the beginning of session_history
+                    self.session_history.insert(0, latest_system_msg)
+                else:
+                    # If no system message was found, add the current system message
+                    self.messages_add(role="system", content=self.system)
                 
                 # Normalize to current SDK format
                 self._normalizer(force=True)
@@ -1969,12 +2003,10 @@ class Interactor:
                 self._log(f"[SESSION] Switched to session '{session_id}'")
             except Exception as e:
                 self.logger.error(f"Failed to load session '{session_id}': {e}")
-                self.session_history = []
-                self.history = []
+                self.session_reset()
         else:
-            self.session_history = []
-            self.history = []
-
+            # Reset to empty state with system message
+            self.session_reset()
 
     def session_reset(self):
         """
@@ -1984,8 +2016,20 @@ class Interactor:
         """
         self.session_id = None
         self._last_session_id = None
+        
+        # Clear histories
+        self.session_history = []
         self.history = []
-        self.system = self.messages_system("You are a helpful Assistant.")
+        
+        # Reapply the system message
+        if hasattr(self, "system") and self.system:
+            # Add to session_history
+            self.messages_add(role="system", content=self.system)
+        else:
+            # Ensure we have a default system message
+            self.system = "You are a helpful Assistant."
+            self.messages_add(role="system", content=self.system)
+        
         self._log("[SESSION] Reset to in-memory mode")
 
     def _normalizer(self, force=False, new_message_only=False):
@@ -2034,7 +2078,6 @@ class Interactor:
             for msg in self.session_history:
                 self._generic_normalize_message(msg)
 
-
     def _openai_normalizer(self):
         """
         Convert standardized session_history to OpenAI-compatible format in self.history.
@@ -2042,27 +2085,20 @@ class Interactor:
         # For OpenAI, we need to include system message in the history
         # and convert tool calls/results to OpenAI format
 
-        # First, find and add the system message if present
-        for msg in self.session_history:
-            if msg["role"] == "system":
-                self.history.append({
-                    "role": "system",
-                    "content": msg["content"]
-                })
-                break
-        
-        # If no system message was found but we have a system prompt, add it
-        if not any(m["role"] == "system" for m in self.history) and self.system:
-            self.history.append({
-                "role": "system",
-                "content": self.system
-            })
-        
+        # Start with empty history
+        self.history = []
+
+        # First, add the current system message at position 0
+        self.history.append({
+            "role": "system",
+            "content": self.system
+        })
+
         # Process all non-system messages
         for msg in self.session_history:
             if msg["role"] == "system":
                 continue  # Skip system messages, already handled
-            
+
             # Handle different message types
             if msg["role"] == "user":
                 # User messages are straightforward
@@ -2070,13 +2106,13 @@ class Interactor:
                     "role": "user",
                     "content": msg["content"]
                 })
-            
+
             elif msg["role"] == "assistant":
-                # For assistant messages, we need to handle potential tool calls
+                # For assistant messages with tool calls
                 if "metadata" in msg and msg["metadata"].get("tool_info"):
                     # This is an assistant message with tool calls
                     tool_info = msg["metadata"]["tool_info"]
-                    
+
                     # Create OpenAI assistant message with tool calls
                     assistant_msg = {
                         "role": "assistant",
@@ -2097,7 +2133,7 @@ class Interactor:
                         "role": "assistant",
                         "content": msg["content"]
                     })
-            
+
             elif msg["role"] == "tool":
                 # Tool response messages
                 if "metadata" in msg and "tool_info" in msg["metadata"]:
@@ -2108,22 +2144,24 @@ class Interactor:
                     }
                     self.history.append(tool_msg)
 
-
     def _anthropic_normalizer(self):
         """
         Convert standardized session_history to Anthropic-compatible format in self.history.
         """
         # For Anthropic, we don't include system message in the history
-        # and need to handle content blocks for tool use/results
+        # but need to handle content blocks for tool use/results
+        
+        # Start with empty history
+        self.history = []
 
         # Process all non-system messages
-        current_tool_use_id = None
-
         for msg in self.session_history:
             if msg["role"] == "system":
-                # Store system prompt separately
-                self.system = msg["content"]
-                continue
+                # Update system prompt if this is the most recent system message
+                # (only apply the most recent system message if we have multiple)
+                if msg == self.session_history[-1] or all(m["role"] != "system" for m in self.session_history[self.session_history.index(msg)+1:]):
+                    self.system = msg["content"]
+                continue  # Skip system messages in history
 
             # Handle different message types
             if msg["role"] == "user":
@@ -2148,7 +2186,7 @@ class Interactor:
                         "role": "user",
                         "content": msg["content"]
                     })
-
+            
             elif msg["role"] == "assistant":
                 # For assistant messages, check for tool use
                 if "metadata" in msg and "tool_info" in msg["metadata"]:
@@ -2206,19 +2244,29 @@ class Interactor:
         """Normalize a single message to OpenAI format and add to history."""
         role = msg.get("role")
         content = msg.get("content")
-        
+
         if role == "system":
-            self.history.append({
-                "role": "system",
-                "content": content
-            })
-            
+            # Check if we already have a system message in history
+            system_index = next((i for i, m in enumerate(self.history)
+                                 if m.get("role") == "system"), None)
+            if system_index is not None:
+                # Update existing system message
+                self.history[system_index]["content"] = content
+            else:
+                # Insert new system message at the beginning
+                self.history.insert(0, {
+                    "role": "system",
+                    "content": content
+                })
+            # Update the system property
+            self.system = content
+
         elif role == "user":
             self.history.append({
                 "role": "user",
                 "content": content
             })
-            
+
         elif role == "assistant":
             # For assistant messages, handle potential tool calls
             if "metadata" in msg and msg["metadata"].get("tool_info"):
