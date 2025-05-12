@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-12 14:52:45
+# Modified: 2025-05-12 15:01:58
 
 import os
 import re
@@ -56,48 +56,6 @@ console = Console()
 log = console.log
 print = console.print
 
-PROVIDERS = {
-    "openai": {
-        "sdk": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "api_key": api_key or os.getenv("OPENAI_API_KEY") or None
-    },
-    "ollama": {
-        "sdk": "openai",
-        "base_url": "http://localhost:11434/v1",
-        "api_key": api_key or "ollama"
-    },
-    "nvidia": {
-        "sdk": "openai",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "api_key": api_key or os.getenv("NVIDIA_API_KEY") or None
-    },
-    "google": {
-        "sdk": "openai",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "api_key": api_key or os.getenv("GEMINI_API_KEY") or None
-    },
-    "anthropic": {
-        "sdk": "anthropic",
-        "base_url": "https://api.anthropic.com/v1",
-        "api_key": api_key or os.getenv("ANTHROPIC_API_KEY") or None
-    },
-    "mistral": {
-        "sdk": "openai",
-        "base_url": "https://api.mistral.ai/v1",
-        "api_key": api_key or os.getenv("MISTRAL_API_KEY") or None
-    },
-    "deepseek": {
-        "sdk": "openai",
-        "base_url": "https://api.deepseek.com",
-        "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or None
-    },
-    "grok": {
-        "sdk": "grok",
-        "base_url": "https://api.x.ai/v1",
-        "api_key": api_key or os.getenv("GROK_API_KEY") or None
-    }
-}
 
 class Interactor:
     def __init__(
@@ -134,9 +92,51 @@ class Interactor:
             ValueError: If provider is not supported or API key is missing for non-Ollama providers.
         """
         self.system = "You are a helpful Assistant."
-        self.providers = PROVIDERS
         self.logger = logging.getLogger(f"InteractorLogger_{id(self)}")
         self.logger.setLevel(logging.DEBUG)
+        self.providers = {
+            "openai": {
+                "sdk": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": api_key or os.getenv("OPENAI_API_KEY") or None
+            },
+           "ollama": {
+                "sdk": "openai",
+                "base_url": "http://localhost:11434/v1",
+                "api_key": api_key or "ollama"
+            },
+            "nvidia": {
+                "sdk": "openai",
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "api_key": api_key or os.getenv("NVIDIA_API_KEY") or None
+            },
+            "google": {
+                "sdk": "openai",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "api_key": api_key or os.getenv("GEMINI_API_KEY") or None
+            },
+            "anthropic": {
+                "sdk": "anthropic",
+                "base_url": "https://api.anthropic.com/v1",
+                "api_key": api_key or os.getenv("ANTHROPIC_API_KEY") or None
+            },
+            "mistral": {
+                "sdk": "openai",
+                "base_url": "https://api.mistral.ai/v1",
+                "api_key": api_key or os.getenv("MISTRAL_API_KEY") or None
+            },
+            "deepseek": {
+                "sdk": "openai",
+                "base_url": "https://api.deepseek.com",
+                "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or None
+            },
+            "grok": {
+                "sdk": "grok",
+                "base_url": "https://api.x.ai/v1",
+                "api_key": api_key or os.getenv("GROK_API_KEY") or None
+            }
+        }
+
 
         # Console log handler (always enabled at WARNING+)
         if not self.logger.handlers:
