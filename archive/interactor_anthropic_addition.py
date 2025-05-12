@@ -8,13 +8,12 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-11 22:41:08
+# Modified: 2025-05-11 16:47:27
 
 import os
 import re
 import sys
 import json
-import uuid
 import subprocess
 import inspect
 import argparse
@@ -35,7 +34,7 @@ from typing import (
     get_origin,
     get_args
 )
-from datetime import datetime, timezone
+from datetime import datetime
 
 import openai
 from openai import OpenAIError, RateLimitError, APIConnectionError
@@ -116,7 +115,6 @@ class Interactor:
         self.last_token_estimate = 0
         self.stream = stream
         self.tools = []
-        self.session_history = []
         self.history = []
         self.context_length = context_length
         self.encoding = None
@@ -206,9 +204,6 @@ class Interactor:
 
         provider, model_name = model.split(":", 1)
 
-        if not hasattr(self, "session_history"):
-            self.session_history = []
-
         # Skip setup if nothing has changed (client may not yet exist on first call)
         if (
             hasattr(self, "client")
@@ -255,7 +250,7 @@ class Interactor:
             self.logger.warning(f"Tool calling not supported for {provider}:{model_name}")
 
         # Normalize session history to match SDK after any provider/model change
-        self._normalizer(force=True)
+        self._normalize_history_to_sdk()
 
         self._log(f"[MODEL] Switched to {provider}:{model_name}")
 
@@ -342,14 +337,14 @@ class Interactor:
             self.logger.error(f"Tool support check failed for {self.provider}:{self.model} — {e}")
             return False
 
+        
     def add_function(
         self,
         external_callable: Callable,
         name: Optional[str] = None,
         description: Optional[str] = None,
         override: bool = False,
-        disabled: bool = False,
-        schema_extensions: Optional[Dict[str, Any]] = None
+        disabled: bool = False
     ):
         """
         Register a function for LLM tool calling with full type hints and metadata.
@@ -360,240 +355,97 @@ class Interactor:
             description (Optional[str]): Optional custom description. Defaults to first line of docstring.
             override (bool): If True, replaces an existing tool with the same name.
             disabled (bool): If True, registers the function in a disabled state.
-            schema_extensions (Optional[Dict[str, Any]]): Optional dictionary mapping parameter names to 
-                schema extensions that override or add to the auto-generated schema.
 
         Raises:
             ValueError: If the callable is invalid or duplicate name found without override.
 
         Example:
-            interactor.add_function(
-                my_tool, 
-                override=True, 
-                disabled=False,
-                schema_extensions={
-                    "param1": {"minimum": 0, "maximum": 100},
-                    "param2": {"format": "email"}
-                }
-            )
+            interactor.add_function(my_tool, override=True, disabled=False)
         """
         def _python_type_to_schema(ptype: Any) -> dict:
             """Convert a Python type annotation to OpenAI-compatible JSON Schema."""
-            # Handle None case
-            if ptype is None:
-                return {"type": "null"}
-            
-            # Get the origin and arguments of the type
             origin = get_origin(ptype)
             args = get_args(ptype)
-            
-            # Handle Union types (including Optional)
-            if origin is Union:
-                # Check for Optional (Union with None)
-                none_type = type(None)
-                if none_type in args:
-                    non_none = [a for a in args if a is not none_type]
-                    if len(non_none) == 1:
-                        inner = _python_type_to_schema(non_none[0])
-                        inner_copy = inner.copy()
-                        inner_copy["nullable"] = True
-                        return inner_copy
-                    # Multiple types excluding None
-                    types = [_python_type_to_schema(a) for a in non_none]
-                    return {"anyOf": types, "nullable": True}
-                # Regular Union without None
-                return {"anyOf": [_python_type_to_schema(a) for a in args]}
-            
-            # Handle List and similar container types
+
+            if origin is Union and type(None) in args:
+                non_none = [a for a in args if a is not type(None)]
+                if len(non_none) == 1:
+                    inner = _python_type_to_schema(non_none[0])
+                    return {**inner, "nullable": True}
+                return {"type": "object"}  # fallback
+
             if origin in (list, List):
-                item_type = args[0] if args else Any
-                if item_type is Any:
-                    return {"type": "array"}
+                item_type = args[0] if args else str
                 return {"type": "array", "items": _python_type_to_schema(item_type)}
-            
-            # Handle Dict types with typing info
             if origin in (dict, Dict):
-                if not args or len(args) != 2:
-                    return {"type": "object"}
-                
-                key_type, val_type = args
-                # We can only really use val_type in JSON Schema
-                if val_type is not Any and val_type is not object:
-                    return {
-                        "type": "object",
-                        "additionalProperties": _python_type_to_schema(val_type)
-                    }
-                return {"type": "object"}
-            
-            # Handle Literal types for enums
-            if origin is Literal:
-                values = args
-                # Try to determine type from values
-                if all(isinstance(v, str) for v in values):
-                    return {"type": "string", "enum": list(values)}
-                elif all(isinstance(v, bool) for v in values):
-                    return {"type": "boolean", "enum": list(values)}
-                elif all(isinstance(v, (int, float)) for v in values):
-                    return {"type": "number", "enum": list(values)}
-                else:
-                    # Mixed types, use anyOf
-                    return {"anyOf": [{"type": _get_json_type(v), "enum": [v]} for v in values]}
-            
-            # Handle basic types
-            if ptype is str:
+                return {"type": "object"}  # optionally expand props later
+            if ptype == str:
                 return {"type": "string"}
-            if ptype is int:
-                return {"type": "integer"}
-            if ptype is float:
+            if ptype in (int, float):
                 return {"type": "number"}
-            if ptype is bool:
+            if ptype == bool:
                 return {"type": "boolean"}
-            
-            # Handle common datetime types
-            if ptype is datetime:
-                return {"type": "string", "format": "date-time"}
-            if ptype is date:
-                return {"type": "string", "format": "date"}
-            
-            # Handle UUID
-            if ptype is uuid.UUID:
-                return {"type": "string", "format": "uuid"}
-            
-            # Default to object for any other types
+
             return {"type": "object"}
-        
-        def _get_json_type(value):
-            """Get the JSON Schema type name for a Python value."""
-            if isinstance(value, str):
-                return "string"
-            elif isinstance(value, bool):
-                return "boolean"
-            elif isinstance(value, int) or isinstance(value, float):
-                return "number"
-            elif isinstance(value, list):
-                return "array"
-            elif isinstance(value, dict):
-                return "object"
-            else:
-                return "object"  # Default
-        
+
         def _parse_param_docs(docstring: str) -> dict:
             """Extract parameter descriptions from a docstring."""
             if not docstring:
                 return {}
-            
+
             lines = docstring.splitlines()
             param_docs = {}
             current_param = None
             in_params = False
-            
-            # Regular expressions for finding parameter sections and param lines
+
             param_section_re = re.compile(r"^(Args|Parameters):\s*$")
             param_line_re = re.compile(r"^\s{4}(\w+)\s*(?:\([^\)]*\))?:\s*(.*)")
-            
+
             for line in lines:
-                # Check if we're entering the parameters section
                 if param_section_re.match(line.strip()):
                     in_params = True
                     continue
-                    
                 if in_params:
-                    # Skip empty lines
                     if not line.strip():
                         continue
-                        
-                    # Check for a parameter definition line
                     match = param_line_re.match(line)
                     if match:
                         current_param = match.group(1)
                         param_docs[current_param] = match.group(2).strip()
-                    # Check for continuation of a parameter description
                     elif current_param and line.startswith(" " * 8):
                         param_docs[current_param] += " " + line.strip()
-                    # If we see a line that doesn't match our patterns, we're out of the params section
                     else:
-                        current_param = None
-            
+                        current_param = None  # reset on malformed or unrelated line
+
             return param_docs
-        
-        # Start of main function logic
-        
-        # Skip if tools are disabled
+
         if not self.tools_enabled:
             return
-            
-        # Validate input callable
         if not external_callable:
             raise ValueError("A valid external callable must be provided.")
-        
-        # Set function name, either from parameter or from callable's __name__
+
         function_name = name or external_callable.__name__
-        
-        # Try to get docstring and extract description
-        try:
-            docstring = inspect.getdoc(external_callable)
-            description = description or (docstring.split("\n")[0].strip() if docstring else "No description provided.")
-        except Exception as e:
-            self._log(f"[TOOL] Warning: Could not extract docstring from {function_name}: {e}", level="warning")
-            docstring = ""
-            description = description or "No description provided."
-        
-        # Extract parameter documentation from docstring
+        docstring = inspect.getdoc(external_callable)
+        description = description or (docstring.split("\n")[0] if docstring else "No description provided.")
         param_docs = _parse_param_docs(docstring)
-        
-        # Handle conflicts with existing functions
+
         if override:
             self.delete_function(function_name)
         elif any(t["function"]["name"] == function_name for t in self.tools):
             raise ValueError(f"Function '{function_name}' is already registered. Use override=True to replace.")
-        
-        # Try to get function signature for parameter info
-        try:
-            signature = inspect.signature(external_callable)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Cannot inspect callable '{function_name}': {e}")
-        
-        # Process parameters to build schema
+
+        signature = inspect.signature(external_callable)
         properties = {}
         required = []
-        
+
         for param_name, param in signature.parameters.items():
-            # Skip self, cls parameters for instance/class methods
-            if param_name in ("self", "cls") and param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
-                continue
-                
-            # Get parameter annotation, defaulting to Any
-            annotation = param.annotation if param.annotation != inspect.Parameter.empty else Any
-            
-            try:
-                # Convert Python type to JSON Schema
-                schema = _python_type_to_schema(annotation)
-                
-                # Add description from docstring or create a default one
-                schema["description"] = param_docs.get(param_name, f"{param_name} parameter")
-                
-                # Add to properties
-                properties[param_name] = schema
-                
-                # If no default, add to required list
-                if param.default == inspect.Parameter.empty:
-                    required.append(param_name)
-                    
-            except Exception as e:
-                self._log(f"[TOOL] Error processing parameter {param_name} for {function_name}: {e}", level="error")
-                # Add a basic object schema as fallback
-                properties[param_name] = {
-                    "type": "object",
-                    "description": f"{param_name} parameter (type conversion failed)"
-                }
-        
-        # Apply schema extensions if provided
-        if schema_extensions:
-            for param_name, extensions in schema_extensions.items():
-                if param_name in properties:
-                    properties[param_name].update(extensions)
-        
-        # Build the final tool specification
+            schema = _python_type_to_schema(param.annotation)
+            schema["description"] = param_docs.get(param_name, f"{param_name} parameter")
+            properties[param_name] = schema
+
+            if param.default == inspect.Parameter.empty:
+                required.append(param_name)
+
         tool_spec = {
             "type": "function",
             "function": {
@@ -606,23 +458,13 @@ class Interactor:
                 }
             }
         }
-        
-        # Set disabled flag if requested
+
         if disabled:
             tool_spec["function"]["disabled"] = True
-        
-        # Add to tools list
-        self.tools.append(tool_spec)
-        
-        # Make the function available as an attribute on the instance
-        setattr(self, function_name, external_callable)
-        
-        # Log the registration
-        self._log(f"[TOOL] Registered function '{function_name}' with {len(properties)} parameters", level="info")
-        
-        return function_name  # Return the name for reference
 
-        
+        self.tools.append(tool_spec)
+        setattr(self, function_name, external_callable)
+
     def disable_function(self, name: str) -> bool:
         """
         Disable a registered tool function by name.
@@ -779,7 +621,7 @@ class Interactor:
                         print(f"[yellow]Model '{model_key}' failed. Switching to fallback: {self.fallback_model}[/yellow]")
                         self._setup_client(self.fallback_model)
                         self._setup_encoding()
-                        self._normalizer()
+                        self._normalize_history_to_sdk()
                         return await func(*args, **kwargs)  # retry once with fallback model
                     else:
                         self.logger.error(f"All {self.max_retries} retries failed: {e}")
@@ -798,6 +640,7 @@ class Interactor:
                 self.logger.error(f"Unexpected error: {e}")
                 raise
 
+
     def interact(
         self,
         user_input: Optional[str],
@@ -809,7 +652,27 @@ class Interactor:
         output_callback: Optional[Callable[[str], None]] = None,
         session_id: Optional[str] = None
     ) -> Optional[str]:
-        """Main universal gateway for all LLM interaction."""
+        """Main universal gateway for all LLM interaction.
+        
+        This method handles the complete interaction pipeline, including:
+        - Token estimation and context management
+        - Tool calling functionality with proper looping
+        - Streaming for the complete interaction (including after tool calls)
+        - Session management
+        
+        Args:
+            user_input: The user's message
+            quiet: If True, suppresses console output
+            tools: If True, enables tool calling
+            stream: If True, streams the response tokens
+            markdown: If True, renders responses as markdown
+            model: Optional model override
+            output_callback: Optional callback for streaming tokens
+            session_id: Optional session ID for history persistence
+            
+        Returns:
+            The complete response text, or None if the input was empty
+        """
         if not user_input:
             return None
 
@@ -823,8 +686,9 @@ class Interactor:
             self.session_id = session_id
             self.session_load(session_id)
 
-        # Add user message using message_add
-        self.message_add(role="user", content=user_input)
+        # Add user message
+        user_msg = {"role": "user", "content": user_input}
+        self.history.append(user_msg)
 
         # Log token count estimate
         token_count = self._count_tokens(self.history)
@@ -838,6 +702,10 @@ class Interactor:
                     print("[red]Context window exceeded. Cannot proceed.[/red]")
                 return None
 
+        # Save user message to session
+        if self.session_enabled and self.session_id:
+            self.session.msg_insert(self.session_id, user_msg)
+
         # Log user input
         self._log(f"[USER] {user_input}")
 
@@ -850,10 +718,10 @@ class Interactor:
             markdown=markdown,
             output_callback=output_callback
         ))
-
+        
         # Log completion for this interaction
         self._log(f"[INTERACTION] Completed with {len(self.history)} total messages")
-
+        
         return result
 
     async def _interact_async_core(
@@ -877,18 +745,21 @@ class Interactor:
         max_iterations = 5  # Prevent infinite loops
         iterations = 0
         
+        # Use the same streaming settings for all iterations if streaming is enabled
+        stream_all = stream
+        
         # Main interaction loop - continues until no more tool calls or max iterations reached
         while iterations < max_iterations:
             iterations += 1
             
             try:
-                # Execute the appropriate SDK runner - history is already normalized
+                # Execute the appropriate SDK runner
                 response_data = await self.sdk_runner(
                     model=self.model,
                     messages=self.history,
-                    stream=stream,
+                    stream=stream_all,  # Use the same streaming setting for all iterations
                     markdown=markdown,
-                    quiet=quiet if iterations == 1 else False,
+                    quiet=quiet if iterations == 1 else False,  # Only be quiet on first iteration if requested
                     live=live,
                     output_callback=output_callback
                 )
@@ -900,70 +771,157 @@ class Interactor:
                 # Log the response data for debugging
                 self._log(f"[ITERATION {iterations}] Content: {len(content)} chars, Tool calls: {len(tool_calls)}")
                 
-                # Add content to full response
+                # Add content to full response - for first response or continuations
                 if iterations == 1:
                     full_content = content
                 elif content:
+                    # For continuations, make it clear this is a continuation after tool usage
+                    if not stream_all and not quiet:
+                        print(f"\n[Model continuation after tool call]: {content}")
+                    
+                    # Only add a separator if both have content
                     if full_content and content:
                         full_content += f"\n{content}"
                     else:
                         full_content = content
                 
-                # Add assistant message with or without tool calls
-                if tool_calls:
-                    # Process each tool call
-                    for call in tool_calls:
-                        # Add assistant message with tool call
-                        tool_info = {
-                            "id": call["id"],
-                            "name": call["function"]["name"],
-                            "arguments": call["function"]["arguments"]
+                # Create assistant message for history
+                if len(tool_calls) > 0:
+                    # With tool calls, create different assistant messages based on SDK
+                    if self.sdk == "openai":
+                        # Format for OpenAI
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": content,
+                            "tool_calls": [
+                                {
+                                    "id": call["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": call["function"]["name"],
+                                        "arguments": call["function"]["arguments"]
+                                    }
+                                } for call in tool_calls
+                            ]
                         }
                         
-                        # Add the assistant message with tool call
-                        self.message_add(
-                            role="assistant", 
-                            content=content if len(tool_calls) == 1 else "",
-                            tool_info=tool_info
-                        )
+                    elif self.sdk == "anthropic":
+                        # For Anthropic, we need to handle each tool call separately
+                        msg_content = []
                         
-                        # Execute the tool
-                        call_name = call["function"]["name"]
-                        call_args = call["function"]["arguments"]
-                        call_id = call["id"]
-                        
-                        result = await self._handle_tool_call_async(
-                            call_name, call_args, call_id,
-                            {"model": self.model, "messages": self.history, "stream": stream},
-                            markdown, live, False, output_callback
-                        )
-                        
-                        # Add tool result message
-                        tool_result_info = {
-                            "id": call_id,
-                            "result": result
-                        }
-                        
-                        self.message_add(
-                            role="tool",
-                            content=result,
-                            tool_info=tool_result_info
-                        )
-                        
-                        # If we're streaming, indicate waiting for response
-                        if stream and not quiet:
-                            print("\nWaiting for model to process tool results...")
+                        # Add text content if present
+                        if content:
+                            format_content = {
+                                "type": "text",
+                                "text": content
+                            }
+                            msg_content.append(format_content)
+
+                        # Add tool calls as properly formatted objects
+                        for call in tool_calls:
+                            # Parse arguments to ensure it's a dictionary
+                            try:
+                                # If arguments is a string, parse it to dictionary
+                                if isinstance(call["function"]["arguments"], str):
+                                    args_dict = json.loads(call["function"]["arguments"])
+                                else:
+                                    args_dict = call["function"]["arguments"]
+                            except json.JSONDecodeError:
+                                # If parsing fails, create a simple text dictionary
+                                args_dict = {"text": call["function"]["arguments"]}
+                                
+                            format_tool_calls = {
+                                "type": "tool_use",
+                                "id": call["id"],
+                                "name": call["function"]["name"],
+                                "input": args_dict  # Must be a dictionary, not a string
+                            }
+                            msg_content.append(format_tool_calls)
+
+                        assistant_msg = {"role": "assistant", "content": msg_content}
+
+                    # Generic Session Recorded for session history
+                    session_msg = {
+                        "role": "assistant",
+                        "content": content, 
+                        "tool_calls": tool_calls
+                    }
                 else:
-                    # Simple assistant response without tool calls
-                    self.message_add(role="assistant", content=content)
-                    break  # No more tools to process, we're done
+                    # Simple response without tool calls
+                    assistant_msg = {"role": "assistant", "content": content}
+                    session_msg = assistant_msg
+
+                self.history.append(assistant_msg) 
+                if self.session_enabled and self.session_id:
+                    self.session.msg_insert(self.session_id, session_msg)
+
+                # If no tool calls or tools disabled, we're done
+                if not tool_calls or not tool_enabled:
+                    break
                 
-                # Reset live display if needed
-                if stream and live:
+                # Process each tool call
+                for call in tool_calls:
+                    call_name = call["function"]["name"]
+                    call_args = call["function"]["arguments"]
+                    call_id = call["id"]
+                    
+                    # Execute the tool
+                    result = await self._handle_tool_call_async(
+                        call_name, call_args, call_id,
+                        {"model": self.model, "messages": self.history, "stream": stream},
+                        markdown, live, False, output_callback
+                    )
+                    
+                    # Format the tool result based on SDK
+                    if self.sdk == "openai":
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(result) if isinstance(result, (dict, list)) else str(result)
+                        }
+                    elif self.sdk == "anthropic":
+                        # Anthropic uses a special user message with tool_result content
+                        tool_msg = {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": call_id,
+                                    "content": json.dumps(result) if isinstance(result, (dict, list)) else str(result)
+                                }
+                            ]
+                        }
+                    else:
+                        # Generic fallback
+                        tool_msg = {
+                            "role": "tool",
+                            "content": json.dumps(result) if isinstance(result, (dict, list)) else str(result),
+                            self.tool_key: call_id
+                        }
+                    
+                    # Generic session history format
+                    session_tool_msg = {
+                        "role": "tool",
+                        "content": json.dumps(result) if isinstance(result, (dict, list)) else str(result),
+                        self.tool_key: call_id
+                    }
+                    
+                    # Add tool message to history
+                    self.history.append(tool_msg)
+                    if self.session_enabled and self.session_id:
+                        self.session.msg_insert(self.session_id, session_tool_msg)
+                    
+                    # If we're streaming, indicate that we're waiting for the model's response to the tool call
+                # If we're in streaming mode and have Live, we need to reset it for the next iteration
+                if stream_all and live:
+                    # Stop the current live instance
                     live.stop()
+                    # Create a new live instance for the next iteration
                     live = Live(console=console, refresh_per_second=100)
                     live.start()
-            
+                    
+                # Continue the loop to get the model's response to tool calls    
+                
             except Exception as e:
                 self.logger.error(f"[{self.sdk.upper()} ERROR] {str(e)}")
                 self._log(f"[ERROR] Error in interaction loop: {str(e)}", level="error")
@@ -971,10 +929,11 @@ class Interactor:
                     live.stop()
                 return f"Error: {str(e)}"
         
-        # Clean up display
+        # Clean up live display if needed
         if live:
             live.stop()
         
+        # Ensure we have a reasonable response even if something went wrong
         return full_content or "No response."
 
     async def _openai_runner(
@@ -989,13 +948,81 @@ class Interactor:
         output_callback=None
     ):
         """Handle OpenAI-specific API interactions and response processing."""
-        # Log what we're sending for debugging
-        self._log(f"[OPENAI REQUEST] Sending request to {model} with {len(self.history)} messages", level="debug")
+        # Normalize messages for OpenAI format
+        openai_messages = []
+        for msg in messages:
+            # Skip duplicate system messages
+            if msg.get("role") == "system" and any(m.get("role") == "system" for m in openai_messages):
+                continue
+            
+            # Handle special message formats
+            if msg.get("role") == "tool":
+                # OpenAI requires tool_call_id for tool messages
+                tool_msg = {
+                    "role": "tool",
+                    "content": msg.get("content", ""),
+                    "tool_call_id": msg.get("tool_call_id") or msg.get(self.tool_key)
+                }
+                
+                # Skip malformed tool messages
+                if not tool_msg.get("tool_call_id"):
+                    self._log(f"[OPENAI WARNING] Skipping malformed tool message: {msg}", level="warning")
+                    continue
+                    
+                openai_messages.append(tool_msg)
+            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                # Handle assistant messages with tool calls
+                asst_msg = {
+                    "role": "assistant",
+                    "content": msg.get("content", "")
+                }
+                
+                # Add tool_calls if present
+                if msg.get("tool_calls"):
+                    asst_msg["tool_calls"] = msg["tool_calls"]
+                    
+                openai_messages.append(asst_msg)
+            elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                # Convert Anthropic-style user messages with tool results to OpenAI format
+                # This detects when a message was created for Anthropic but is now being used with OpenAI
+                tool_results = [item for item in msg.get("content", []) if isinstance(item, dict) and item.get("type") == "tool_result"]
+                
+                if tool_results:
+                    for result in tool_results:
+                        tool_msg = {
+                            "role": "tool",
+                            "content": result.get("content", ""),
+                            "tool_call_id": result.get("tool_use_id")
+                        }
+                        if tool_msg.get("tool_call_id"):
+                            openai_messages.append(tool_msg)
+                else:
+                    # Regular user message, convert list content to string if needed
+                    user_msg = {
+                        "role": "user",
+                        "content": msg.get("content", "") if isinstance(msg.get("content"), str) else json.dumps(msg.get("content", ""))
+                    }
+                    openai_messages.append(user_msg)
+            else:
+                # Regular message, just copy it
+                new_msg = {
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", "")
+                }
+                openai_messages.append(new_msg)
+        
+        # Log the messages we're sending
+        self._log(f"[OPENAI REQUEST] Sending {len(openai_messages)} messages to {model}", level="debug")
+        for i, msg in enumerate(openai_messages):
+            role = msg.get("role", "unknown")
+            has_tool_calls = "tool_calls" in msg
+            tool_call_id = msg.get("tool_call_id", "none")
+            self._log(f"[OPENAI MESSAGE {i}] role={role}, has_tool_calls={has_tool_calls}, tool_call_id={tool_call_id}", level="debug")
 
-        # Prepare API parameters - history is already normalized by _normalizer
+        # Prepare API parameters
         params = {
             "model": model,
-            "messages": self.history,
+            "messages": openai_messages,
             "stream": stream,
         }
 
@@ -1024,7 +1051,7 @@ class Interactor:
             async for chunk in response:
                 delta = getattr(chunk.choices[0], "delta", None)
                 finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-
+                
                 # Handle content chunks
                 if hasattr(delta, "content") and delta.content is not None:
                     text = delta.content
@@ -1056,7 +1083,7 @@ class Interactor:
                                 tool_calls_dict[index]["function"]["arguments"] += args
                             if tool_call_delta.id and not tool_calls_dict[index]["id"]:
                                 tool_calls_dict[index]["id"] = tool_call_delta.id
-
+                        
                         # Make sure the ID is set regardless
                         if hasattr(tool_call_delta, "id") and tool_call_delta.id and not tool_calls_dict[index]["id"]:
                             tool_calls_dict[index]["id"] = tool_call_delta.id
@@ -1097,28 +1124,140 @@ class Interactor:
         }
 
     async def _anthropic_runner(
-        self,
-        *,
-        model,
-        messages,
+        self, 
+        *, 
+        model, 
+        messages, 
         stream,
         markdown=False,
         quiet=False,
         live=None,
         output_callback=None
     ):
-        """Handle Anthropic-specific API interactions and response processing."""
-        # Log what we're sending for debugging
-        self._log(f"[ANTHROPIC REQUEST] Sending request to {model} with {len(self.history)} messages", level="debug")
+        """Handle Anthropic-specific API interactions and response processing with enhanced tool calling."""
+        # Convert messages to Anthropic format
+        anthropic_messages = []
+        last_assistant_had_tool_use = False
+        system_prompt = self.system
         
-        # Prepare API parameters - history is already normalized by _normalizer
+        # Check if the last message is from the user and contains certain trigger phrases
+        last_message_is_trigger = False
+        if messages and messages[-1].get("role") == "user":
+            user_content = messages[-1].get("content", "")
+        
+        # Process messages in order
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            # Skip system messages - handled separately in Anthropic
+            if role == "system":
+                system_prompt = content
+                continue
+            
+            # Handle different message types
+            if role == "assistant":
+                # Check if this is a tool use message
+                if msg.get("tool_use") or msg.get("tool_calls"):
+                    # For direct tool_use (already in Anthropic format)
+                    if msg.get("tool_use"):
+                        anthropic_messages.append(msg)
+                        last_assistant_had_tool_use = True
+                        continue
+                    
+                    """
+                    # For OpenAI-style tool_calls, convert to Anthropic tool_use format
+                    for tool_call in msg.get("tool_calls", []):
+                        # Extract the data
+                        tool_id = tool_call.get("id")
+                        name = tool_call.get("function", {}).get("name", "")
+                        arguments = tool_call.get("function", {}).get("arguments", "{}")
+                        
+                        # Convert arguments to proper format
+                        if isinstance(arguments, str):
+                            try:
+                                args_dict = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                args_dict = {"text": arguments}
+                        else:
+                            args_dict = arguments
+                        
+                        # Create the Anthropic tool use message
+                        tool_use_msg = {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_use": {
+                                "id": tool_id,
+                                "name": name,
+                                "input": args_dict
+                            }
+                        }
+                        
+                        anthropic_messages.append(tool_use_msg)
+                        last_assistant_had_tool_use = True
+                    """
+                    
+                    # If the message also had content, add it as a separate message
+                    if content:
+                        anthropic_messages.append({
+                            "role": "assistant", 
+                            "content": content
+                        })
+                    
+                    continue
+                
+                # Regular assistant message (no tool calls)
+                if content:
+                    anthropic_messages.append({"role": "assistant", "content": content})
+                    last_assistant_had_tool_use = False
+            
+            # Handle tool responses - must be paired with a previous tool_use
+            elif role == "tool" or (role == "user" and isinstance(content, list) and any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content)):
+                # Already in Anthropic format with tool_result
+                if role == "user" and isinstance(content, list):
+                    anthropic_messages.append(msg)
+                    continue
+                
+                # Convert from OpenAI tool format to Anthropic format
+                tool_id = msg.get("tool_call_id") or msg.get(self.tool_key)
+                result_content = content
+                
+                # Only add if we have a tool ID and the previous message was a tool use
+                if tool_id and last_assistant_had_tool_use:
+                    anthropic_messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": result_content
+                            }
+                        ]
+                    })
+            
+            # Regular user message
+            elif role == "user":
+                if isinstance(content, str):
+                    anthropic_messages.append({"role": "user", "content": content})
+                elif isinstance(content, list):
+                    # This handles user messages with complex content blocks
+                    anthropic_messages.append({"role": "user", "content": content})
+        
+        # Log the messages we're sending
+        self._log(f"[ANTHROPIC REQUEST] Sending {len(anthropic_messages)} messages to {model}", level="debug")
+        for i, msg in enumerate(anthropic_messages):
+            role = msg.get("role", "unknown")
+            has_tool_use = "tool_use" in msg
+            has_tool_result = isinstance(msg.get("content"), list) and any(isinstance(item, dict) and item.get("type") == "tool_result" for item in msg.get("content", []))
+            self._log(f"[ANTHROPIC MESSAGE {i}] role={role}, has_tool_use={has_tool_use}, has_tool_result={has_tool_result}", level="debug")
+        
+        # Prepare API parameters
         params = {
             "model": model,
-            "messages": self.history,
+            "messages": anthropic_messages,
             "max_tokens": 8192,
-            "system": self.system
+            "system": system_prompt
         }
-        
         # Add tools support if needed
         if self.tools_enabled and self.tools_supported:
             enabled_tools = []
@@ -1164,7 +1303,6 @@ class Interactor:
                                 }
                             }
                             self._log(f"[ANTHROPIC TOOL USE] Found complete tool use: {tool_name}", level="info")
-                    
                     # Handle text content
                     if chunk_type == "content_block_delta" and hasattr(chunk.delta, "text"):
                         delta = chunk.delta.text
@@ -1238,7 +1376,6 @@ class Interactor:
             "content": assistant_content,
             "tool_calls": list(tool_calls_dict.values())
         }
-
 
 
     def _get_enabled_tools(self) -> List[dict]:
@@ -1371,52 +1508,19 @@ class Interactor:
             self._setup_encoding()
         return sum(len(self.encoding.encode(msg.get("content", ""))) for msg in messages if isinstance(msg.get("content"), str))
 
-    def _count_tokens(self, messages, use_cache=True) -> int:
-        """Accurately estimate token count for messages including tool calls with caching support.
+    def _count_tokens(self, messages) -> int:
+        """Accurately estimate token count for messages including tool calls.
 
         Args:
             messages: List of message objects in either OpenAI or Anthropic format.
-            use_cache: Whether to use and update the token count cache.
 
         Returns:
             int: Estimated token count.
         """
-        # Setup encoding if needed
         if not hasattr(self, "encoding") or not self.encoding:
             self._setup_encoding()
-        
-        # Initialize cache if it doesn't exist
-        if not hasattr(self, "_token_count_cache"):
-            self._token_count_cache = {}
-        
-        # Generate a cache key based on message content hashes
-        if use_cache:
-            try:
-                # Create a cache key using message IDs if available, or content hashes
-                cache_key_parts = []
-                for msg in messages:
-                    if isinstance(msg, dict):
-                        # Try to use stable identifiers for cache key
-                        msg_id = msg.get("id", None)
-                        timestamp = msg.get("timestamp", None)
-                        
-                        if msg_id and timestamp:
-                            cache_key_parts.append(f"{msg_id}:{timestamp}")
-                        else:
-                            # Fall back to content-based hash if no stable IDs
-                            content_str = str(msg.get("content", ""))
-                            role = msg.get("role", "unknown")
-                            cache_key_parts.append(f"{role}:{hash(content_str)}")
-                
-                cache_key = ":".join(cache_key_parts)
-                if cache_key in self._token_count_cache:
-                    return self._token_count_cache[cache_key]
-            except Exception as e:
-                # If caching fails, just continue with normal counting
-                self._log(f"[TOKEN COUNT] Cache key generation failed: {e}", level="debug")
-                use_cache = False
-        
-        # For Claude models, try to use their built-in token counter
+
+        # For Claude models, try to use their built-in token counter if available
         if self.sdk == "anthropic":
             try:
                 # Convert messages to Anthropic format if needed
@@ -1424,11 +1528,12 @@ class Interactor:
                 for msg in messages:
                     if msg.get("role") == "system":
                         continue  # System handled separately
-                    
+
                     if msg.get("role") == "tool":
                         # Skip tool messages in token count to avoid double-counting
+                        # since the Anthropic token counter expects tool_result format
                         continue
-                    
+
                     if msg.get("role") == "user" and isinstance(msg.get("content"), list):
                         # Already in Anthropic format with tool_result
                         anthropic_messages.append(msg)
@@ -1439,43 +1544,29 @@ class Interactor:
                                 "role": msg.get("role"),
                                 "content": msg.get("content", "")
                             })
-                
-                # Use Anthropic's token counter if messages exist
-                if anthropic_messages:
-                    response = self.client.messages.count_tokens(
-                        model=self.model,
-                        messages=anthropic_messages,
-                        system=self.system
-                    )
-                    token_count = response.input_tokens
-                    
-                    # Cache the result for future use
-                    if use_cache and 'cache_key' in locals():
-                        self._token_count_cache[cache_key] = token_count
-                    
-                    return token_count
+
+                # Use Anthropic's token counter
+                response = self.client.messages.count_tokens(
+                    model=self.model,
+                    messages=anthropic_messages,
+                    system=self.system
+                )
+                return response.input_tokens
             except Exception as e:
                 # Fall back to our estimation
-                self._log(f"[TOKEN COUNT] Error using Anthropic token counter: {e}", level="debug")
-        
-        # More accurate token counting for all message types
+                self._log(f"[TOKEN COUNT] Error using Anthropic token counter: {e}", level="warning")
+                pass
+
+        # Fallback counting method
         num_tokens = 0
-        
-        # Count tokens for each message
         for msg in messages:
-            # Base token count for message metadata (role + message format)
+            # Base token count for message metadata
             num_tokens += 4  # Message overhead
-            
-            # Add tokens for role name
-            role = msg.get("role", "")
-            num_tokens += len(self.encoding.encode(role))
-            
+
             # Count tokens in message content
             if isinstance(msg.get("content"), str):
                 content = msg.get("content", "")
-                content_tokens = len(self.encoding.encode(content))
-                num_tokens += content_tokens
-                
+                num_tokens += len(self.encoding.encode(content))
             elif isinstance(msg.get("content"), list):
                 # Handle Anthropic-style content lists
                 for item in msg.get("content", []):
@@ -1486,393 +1577,164 @@ class Interactor:
                             if isinstance(result_content, str):
                                 num_tokens += len(self.encoding.encode(result_content))
                             else:
-                                # JSON serialization for dict/list content
                                 num_tokens += len(self.encoding.encode(json.dumps(result_content)))
                             # Add tokens for tool_use_id and type fields
-                            num_tokens += len(self.encoding.encode(item.get("type", "")))
-                            num_tokens += len(self.encoding.encode(item.get("tool_use_id", "")))
-                        
-                        # Text content type
-                        elif item.get("type") == "text":
-                            num_tokens += len(self.encoding.encode(item.get("text", "")))
-                        
-                        # Tool use type
-                        elif item.get("type") == "tool_use":
-                            num_tokens += len(self.encoding.encode(item.get("name", "")))
-                            tool_input = item.get("input", {})
-                            if isinstance(tool_input, str):
-                                num_tokens += len(self.encoding.encode(tool_input))
-                            else:
-                                num_tokens += len(self.encoding.encode(json.dumps(tool_input)))
-                            num_tokens += len(self.encoding.encode(item.get("id", "")))
+                            num_tokens += 10
                     else:
                         # Plain text content
                         num_tokens += len(self.encoding.encode(str(item)))
-            
-            # Count tokens in tool calls for OpenAI format
+
+            # Count tokens in tool calls
             if msg.get("tool_calls"):
                 for tool_call in msg.get("tool_calls", []):
                     if isinstance(tool_call, dict):
                         # Count tokens for function name
                         func_name = tool_call.get("function", {}).get("name", "")
                         num_tokens += len(self.encoding.encode(func_name))
-                        
+
                         # Count tokens for arguments
                         args = tool_call.get("function", {}).get("arguments", "")
                         if isinstance(args, str):
                             num_tokens += len(self.encoding.encode(args))
                         else:
                             num_tokens += len(self.encoding.encode(json.dumps(args)))
-                        
-                        # Add tokens for id and type fields
-                        num_tokens += len(self.encoding.encode(tool_call.get("id", "")))
-                        num_tokens += len(self.encoding.encode(tool_call.get("type", "function")))
-            
-            # Count tokens in Anthropic tool_use field
+
+                        # Add tokens for id and other metadata
+                        num_tokens += 10
+
+            # Count tokens in Anthropic tool_use
             if msg.get("tool_use"):
                 tool_use = msg.get("tool_use")
                 # Count tokens for name
                 num_tokens += len(self.encoding.encode(tool_use.get("name", "")))
-                
+
                 # Count tokens for input
                 tool_input = tool_use.get("input", {})
                 if isinstance(tool_input, str):
                     num_tokens += len(self.encoding.encode(tool_input))
                 else:
                     num_tokens += len(self.encoding.encode(json.dumps(tool_input)))
-                
-                # Add tokens for id field
-                num_tokens += len(self.encoding.encode(tool_use.get("id", "")))
-            
-            # Handle tool response message format
-            if msg.get("role") == "tool":
-                # Add tokens for tool_call_id
-                tool_id = msg.get("tool_call_id", "")
-                num_tokens += len(self.encoding.encode(tool_id))
-        
+
+                # Add tokens for id and other metadata
+                num_tokens += 10
+
+            # Add tokens for role name
+            num_tokens += len(self.encoding.encode(msg.get("role", "")))
+
         # Add message end tokens
         num_tokens += 2
-        
-        # Cache the result for future use
-        if use_cache and 'cache_key' in locals():
-            self._token_count_cache[cache_key] = num_tokens
-        
+
         return num_tokens
 
-    def _cycle_messages(self):
-        """
-        Intelligently trim the message history to fit within the allowed context length.
 
-        This method implements a sophisticated trimming strategy:
-        1. Always preserves system messages
-        2. Always keeps the most recent complete conversation turn
-        3. Prioritizes keeping tool call chains intact
-        4. Preserves important context from earlier exchanges
-        5. Aggressively prunes redundant information before essential content
+    def _cycle_messages(self):
+        """Intelligently trim the message history to fit within the allowed context length.
+
+        This method removes older messages as needed while preserving context coherence.
+        It prioritizes keeping system messages and recent messages while gradually removing
+        older exchanges.
 
         Returns:
             bool: True if all messages were trimmed (context exceeded), False otherwise.
         """
         # Check if we need to trim
         token_count = self._count_tokens(self.history)
-
-        # If we're already under the limit, return early
         if token_count <= self.context_length:
             return False
-
-        self._log(f"[TRIM] Starting message cycling: {token_count} tokens exceeds {self.context_length} limit", level="info")
-
-        # We'll need to track tokens as we reconstruct the history
-        remaining_tokens = token_count
-        target_tokens = max(self.context_length * 0.8, self.context_length - 1000)  # Target 80% or 1000 less than max
-
-        # First pass: identify critical messages we must keep
-        must_keep = []
-        tool_chain_groups = {}  # Group related tool calls and their results
-
-        # Always keep system messages (should be first)
-        system_indices = []
-        for i, msg in enumerate(self.history):
-            if msg.get("role") == "system":
-                system_indices.append(i)
-                must_keep.append(i)
-
-        # Identify the most recent complete exchange (user question + assistant response)
-        latest_exchange = []
-        # Start from the end and work backward to find the last complete exchange
-        for i in range(len(self.history) - 1, -1, -1):
-            msg = self.history[i]
-            if msg.get("role") == "assistant" and not latest_exchange:
-                latest_exchange.append(i)
-            elif msg.get("role") == "user" and latest_exchange:
-                latest_exchange.append(i)
+        
+        exceeded_context = False
+        messages_removed = 0
+        
+        # Define a rough token per message estimate to avoid recounting every loop
+        avg_tokens_per_msg = max(1, token_count // max(1, len(self.history)))
+        
+        # Try to estimate how many messages to remove
+        messages_to_trim = max(1, (token_count - self.context_length) // avg_tokens_per_msg)
+        
+        # Keep track of important messages that shouldn't be removed
+        kept_indices = []
+        
+        # Always keep the system message (index 0 if it exists)
+        if self.history and self.history[0].get("role") == "system":
+            kept_indices.append(0)
+        
+        # Always keep the latest user message and any subsequent messages
+        if len(self.history) >= 2:
+            for i in range(len(self.history) - 1, -1, -1):
+                if self.history[i].get("role") == "user":
+                    # Keep this user message and all messages after it
+                    kept_indices.extend(range(i, len(self.history)))
+                    break
+        
+        # Make a copy of the history for trimming
+        trimmed_history = [msg for i, msg in enumerate(self.history) if i in kept_indices]
+        
+        # Now remove oldest non-preserved messages until we're under the token limit
+        remove_candidates = [i for i in range(len(self.history)) if i not in kept_indices]
+        remove_candidates.sort()  # Remove oldest messages first
+        
+        removed = 0
+        for i in remove_candidates:
+            if self._count_tokens(trimmed_history) <= self.context_length:
                 break
+                
+            self._log(f"[TRIM] Removed message: {self.history[i]}", level="debug")
+            removed += 1
+            messages_removed += 1
+        
+        # Update history with trimmed version
+        self.history = [msg for i, msg in enumerate(self.history) if i in kept_indices or i not in remove_candidates[:removed]]
+        
+        # If still over the limit, more aggressive trimming
+        while self._count_tokens(self.history) > self.context_length and self.history:
+            # Find the oldest non-system message to remove
+            for i in range(len(self.history)):
+                if self.history[i].get("role") != "system":
+                    self._log(f"[TRIM] Emergency removed message: {self.history[i]}", level="debug")
+                    self.history.pop(i)
+                    messages_removed += 1
+                    break
+        
+        # Check if we removed all messages
+        if not self.history or (len(self.history) == 1 and self.history[0].get("role") == "system"):
+            self._log(f"[TRIM] Context length exceeded - all interactive messages trimmed", level="error")
+            exceeded_context = True
+        
+        if messages_removed > 0:
+            self._log(f"[TRIM] Removed {messages_removed} messages to fit within context limit ({self.context_length})", level="info")
+        
+        return exceeded_context
 
-        # Add the latest exchange to must-keep
-        must_keep.extend(latest_exchange)
-
-        # Identify tool chains - track which messages belong to the same tool flow
-        tool_id_to_chain = {}
-        for i, msg in enumerate(self.history):
-            # For assistant messages with tool calls
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tool_call in msg.get("tool_calls"):
-                    tool_id = tool_call.get("id")
-                    if tool_id:
-                        tool_id_to_chain[tool_id] = tool_id_to_chain.get(tool_id, []) + [i]
-
-            # For tool response messages
-            elif msg.get("role") == "tool" and msg.get("tool_call_id"):
-                tool_id = msg.get("tool_call_id")
-                tool_id_to_chain[tool_id] = tool_id_to_chain.get(tool_id, []) + [i]
-
-            # For Anthropic format with tool use
-            elif msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-                for block in msg.get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        tool_id = block.get("id")
-                        if tool_id:
-                            tool_id_to_chain[tool_id] = tool_id_to_chain.get(tool_id, []) + [i]
-
-            # For Anthropic tool result messages
-            elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
-                for block in msg.get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        tool_id = block.get("tool_use_id")
-                        if tool_id:
-                            tool_id_to_chain[tool_id] = tool_id_to_chain.get(tool_id, []) + [i]
-
-        # Group together all indices for each tool chain
-        for tool_id, indices in tool_id_to_chain.items():
-            chain_key = f"tool_{min(indices)}"  # Group by the earliest message
-            if chain_key not in tool_chain_groups:
-                tool_chain_groups[chain_key] = set()
-            tool_chain_groups[chain_key].update(indices)
-
-        # Second pass: calculate tokens for each message
-        message_tokens = []
-        for i, msg in enumerate(self.history):
-            # Count tokens for this individual message
-            tokens = self._count_tokens([msg])
-            message_tokens.append((i, tokens))
-
-        # Keep the messages identified as must-keep
-        keep_indices = set(must_keep)
-
-        # Calculate the tokens we've committed to keeping
-        keep_tokens = sum(tokens for i, tokens in message_tokens if i in keep_indices)
-
-        # Check if we've already exceeded the target with just must-keep messages
-        if keep_tokens > self.context_length:
-            # We're in trouble - the essential messages alone exceed context
-            # Drop older messages until we're under the limit
-            all_indices = sorted(keep_indices)
-
-            # Start dropping oldest messages, but NEVER drop system messages
-            for idx in all_indices:
-                if idx not in system_indices:
-                    keep_indices.remove(idx)
-                    keep_tokens -= message_tokens[idx][1]
-                    if keep_tokens <= target_tokens:
-                        break
-
-            # If we've removed everything but system messages and still over limit
-            if keep_tokens > self.context_length:
-                self._log(f"[TRIM] Critical failure: even with minimal context ({keep_tokens} tokens), we exceed the limit", level="error")
-                # Keep only system messages if any
-                keep_indices = set(system_indices)
-                return True  # Context exceeded completely
-
-        # Third pass: keep the most important tool chains intact
-        available_tokens = target_tokens - keep_tokens
-        # Sort tool chains by recency (assumed by the chain_key which uses the earliest message)
-        sorted_chains = sorted(tool_chain_groups.items(), key=lambda x: x[0], reverse=True)
-
-        for chain_key, indices in sorted_chains:
-            # Skip if we've already decided to keep all messages in this chain
-            if indices.issubset(keep_indices):
-                continue
-
-            # Calculate how many tokens this chain would add
-            chain_tokens = sum(tokens for i, tokens in message_tokens if i in indices and i not in keep_indices)
-
-            # If we can fit the entire chain, keep it
-            if chain_tokens <= available_tokens:
-                keep_indices.update(indices)
-                available_tokens -= chain_tokens
-            # Otherwise, we might want to keep partial chains in the future, but for now, skip
-
-        # Fourth pass: fill in with as many remaining messages as possible, prioritizing recency
-        # Get remaining messages sorted by recency (newest first)
-        remaining_indices = [(i, tokens) for i, tokens in message_tokens if i not in keep_indices]
-        remaining_indices.sort(reverse=True)  # Sort newest first
-
-        for i, tokens in remaining_indices:
-            if tokens <= available_tokens:
-                keep_indices.add(i)
-                available_tokens -= tokens
-
-        # Final message reconstruction
-        self._log(f"[TRIM] Keeping {len(keep_indices)}/{len(self.history)} messages, estimated {target_tokens - available_tokens} tokens", level="info")
-
-        # Create new history with just the kept messages, preserving order
-        new_history = [self.history[i] for i in sorted(keep_indices)]
-        self.history = new_history
-
-        # Update session_history to match the pruned history
-        if hasattr(self, "session_history"):
-            # Map between history items and session_history
-            session_to_keep = []
-
-            # For each session history message, check if it corresponds to a kept message
-            for session_msg in self.session_history:
-                # Keep system messages
-                if session_msg.get("role") == "system":
-                    session_to_keep.append(session_msg)
-                    continue
-
-                # Try to match based on available IDs or content
-                msg_id = session_msg.get("id")
-
-                # For tool messages, check tool_info.id against tool_call_id
-                if "metadata" in session_msg and "tool_info" in session_msg["metadata"]:
-                    tool_id = session_msg["metadata"]["tool_info"].get("id")
-
-                    # Check if this tool_id is still in the kept history
-                    for history_msg in new_history:
-                        # Check standard ids
-                        history_tool_id = None
-
-                        # Check OpenAI format
-                        if history_msg.get("role") == "tool":
-                            history_tool_id = history_msg.get("tool_call_id")
-                        elif history_msg.get("role") == "assistant" and history_msg.get("tool_calls"):
-                            for call in history_msg.get("tool_calls", []):
-                                if call.get("id") == tool_id:
-                                    history_tool_id = call.get("id")
-                                    break
-
-                        # Check Anthropic format
-                        elif isinstance(history_msg.get("content"), list):
-                            for block in history_msg.get("content", []):
-                                if isinstance(block, dict):
-                                    if block.get("type") == "tool_use" and block.get("id") == tool_id:
-                                        history_tool_id = block.get("id")
-                                        break
-                                    elif block.get("type") == "tool_result" and block.get("tool_use_id") == tool_id:
-                                        history_tool_id = block.get("tool_use_id")
-                                        break
-
-                        if history_tool_id == tool_id:
-                            session_to_keep.append(session_msg)
-                            break
-
-                # For regular messages, try content matching as fallback
-                else:
-                    content_match = False
-                    if isinstance(session_msg.get("content"), str) and session_msg.get("content"):
-                        for history_msg in new_history:
-                            if history_msg.get("role") == session_msg.get("role") and history_msg.get("content") == session_msg.get("content"):
-                                content_match = True
-                                break
-
-                    if content_match:
-                        session_to_keep.append(session_msg)
-
-            # Update session_history with kept messages
-            self.session_history = session_to_keep
-
-            # Re-normalize to ensure consistency
-            self._normalizer(force=True)
-
-        # Verify our final token count
-        final_token_count = self._count_tokens(self.history)
-        self._log(f"[TRIM] Final history has {len(self.history)} messages, {final_token_count} tokens", level="info")
-
-        # Return whether we've completely exceeded context
-        return final_token_count > self.context_length or len(self.history) == len(system_indices)
-
-
-    def message_add(
+    def messages_add(
         self,
-        role: str,
-        content: Any,
-        tool_info: Optional[Dict] = None,
-        normalize: bool = True
-    ) -> str:
-        """
-        Add a message to the standardized session_history and then update SDK-specific history.
-        
-        This method is the central point for all message additions to the conversation.
-        
-        Args:
-            role: The role of the message ("user", "assistant", "system", "tool")
-            content: The message content (text or structured)
-            tool_info: Optional tool-related metadata
-            normalize: Whether to normalize history after adding this message
-            
-        Returns:
-            str: Unique ID of the added message
-        """
-        # Generate a unique message ID
-        message_id = str(uuid.uuid4())
-        
-        # Create the standardized message for session_history
-        timestamp = datetime.now(timezone.utc).isoformat()
-        
-        # Store system messages directly
+        role: Optional[str] = None,
+        content: Optional[str] = None
+    ) -> list:
+        """Manage messages in the conversation history."""
+        if role is None and content is None:
+            return self.history
+
+        if content is None and role is not None:
+            raise ValueError("Content must be provided when role is specified")
+        if not content:
+            raise ValueError("Content cannot be empty")
+        if not isinstance(content, str):
+            raise ValueError("Content must be a string")
+
         if role == "system":
-            self.system = content
-        
-        # Create standard format message
-        standard_message = {
-            "role": role,
-            "content": content,
-            "id": message_id,
-            "timestamp": timestamp,
-            "metadata": {
-                "sdk": self.sdk
-            }
-        }
-        
-        # Add tool info if provided
-        if tool_info:
-            standard_message["metadata"]["tool_info"] = tool_info
-        
-        # Add to session_history
-        if not hasattr(self, "session_history"):
-            self.session_history = []
-        
-        self.session_history.append(standard_message)
-        
-        # Save to persistent session if enabled
-        if self.session_enabled and self.session_id:
-            # Convert standard message to session-compatible format
-            session_msg = {
-                "role": role,
-                "content": content,
-                "id": message_id,
-                "timestamp": timestamp
-            }
-            
-            # Add tool-related fields if present
-            if tool_info:
-                for key, value in tool_info.items():
-                    session_msg[key] = value
-            
-            # Store in session
-            self.session.msg_insert(self.session_id, session_msg)
-        
-        # Update the SDK-specific format in self.history by running the normalizer
-        if normalize:
-            # We only need to normalize the most recent message for efficiency
-            # Pass a flag indicating we're just normalizing a new message
-            self._normalizer(force=False, new_message_only=True)
-        
-        # Log the added message
-        self._log(f"[MESSAGE ADDED] {role}: {str(content)[:50]}...")
-        
-        return message_id
+            self.messages_system(content)
+            return self.history
+
+        if role is not None:
+            message = {"role": role, "content": content}
+            self.history.append(message)
+            if self.session_enabled and self.session_id:
+                self.session.msg_insert(self.session_id, message)
+
+            self._log(f"[{role.upper()}] {content}")
+            return self.history
+
+        return self.history
 
     def messages_system(self, prompt: str):
         """Set or retrieve the current system prompt."""
@@ -1914,66 +1776,29 @@ class Interactor:
         return total_tokens
 
     def session_load(self, session_id: Optional[str]):
-        """Load and normalize messages for a specific session."""
+        """
+        Load and normalize messages for a specific session.
+
+        This activates session persistence, restores the prior conversation state,
+        and normalizes message format to match the active SDK (OpenAI/Anthropic/etc).
+
+        Args:
+            session_id (Optional[str]): The session ID to activate, or None for in-memory mode.
+        """
         self.session_id = session_id
         self._last_session_id = session_id
-        
+
         if self.session_enabled and session_id:
             try:
-                # Load raw session data
-                session_data = self.session.load_full(session_id)
-                messages = session_data.get("messages", [])
-                
-                # Convert session format to our standard format
-                self.session_history = []
-                
-                for msg in messages:
-                    # Extract fields
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    msg_id = msg.get("id", str(uuid.uuid4()))
-                    timestamp = msg.get("timestamp", datetime.now(timezone.utc).isoformat())
-                    
-                    # Build tool_info if present
-                    tool_info = None
-                    if any(key in msg for key in ["tool_use_id", "tool_call_id", "name", "arguments"]):
-                        tool_info = {
-                            "id": msg.get("tool_use_id") or msg.get("tool_call_id"),
-                            "name": msg.get("name", "unknown_tool"),
-                            "arguments": msg.get("arguments", {})
-                        }
-                    
-                    # Create standard message
-                    standard_msg = {
-                        "role": role,
-                        "content": content,
-                        "id": msg_id,
-                        "timestamp": timestamp,
-                        "metadata": {
-                            "sdk": self.sdk
-                        }
-                    }
-                    
-                    if tool_info:
-                        standard_msg["metadata"]["tool_info"] = tool_info
-                    
-                    self.session_history.append(standard_msg)
-                    
-                    # Set system prompt if found
-                    if role == "system":
-                        self.system = content
-                
-                # Normalize to current SDK format
-                self._normalizer(force=True)
-                
+                self.history = self.session.load(session_id)
                 self._log(f"[SESSION] Switched to session '{session_id}'")
             except Exception as e:
                 self.logger.error(f"Failed to load session '{session_id}': {e}")
-                self.session_history = []
                 self.history = []
         else:
-            self.session_history = []
             self.history = []
+
+        self._normalize_history_to_sdk()
 
 
     def session_reset(self):
@@ -1988,489 +1813,200 @@ class Interactor:
         self.system = self.messages_system("You are a helpful Assistant.")
         self._log("[SESSION] Reset to in-memory mode")
 
-    def _normalizer(self, force=False, new_message_only=False):
-        """
-        Central normalization function that transforms the standard session_history
-        into the SDK-specific format needed in self.history.
-        
-        Args:
-            force (bool): If True, always normalize even if SDK hasn't changed.
-                         Default is False, which only normalizes on SDK change.
-            new_message_only (bool): If True, only normalize the most recent message
-                                   for efficiency when adding single messages.
-        """
-        # Skip normalization if SDK hasn't changed and force is False
-        if not force and hasattr(self, '_last_sdk') and self._last_sdk == self.sdk:
-            # If we only need to normalize the most recent message
-            if new_message_only and self.session_history:
-                # Get the most recent message from session_history
-                recent_msg = self.session_history[-1]
-                
-                # Apply SDK-specific normalization for just this message
-                if self.sdk == "openai":
-                    self._openai_normalize_message(recent_msg)
-                elif self.sdk == "anthropic":
-                    self._anthropic_normalize_message(recent_msg)
-                else:
-                    # Generic handler for unknown SDKs
-                    self._generic_normalize_message(recent_msg)
-                    
-                return
-        
-        # Record the current SDK to detect future changes
-        self._last_sdk = self.sdk
-        
-        # For full normalization, clear current history and rebuild it
-        self.history = []
-        
-        # Call the appropriate SDK-specific normalizer
-        if self.sdk == "openai":
-            self._openai_normalizer()
-        elif self.sdk == "anthropic":
-            self._anthropic_normalizer()
+    def _normalize_history_to_sdk(self):
+        """Ensure self.history and self.system are compatible with the active SDK."""
+
+        # Remove any duplicate system messages first
+        self.history = [m for i, m in enumerate(self.history)
+                        if m.get("role") != "system" or
+                        all(n.get("role") != "system" for n in self.history[:i])]
+
+        if self.sdk == "anthropic":
+            # Strip system role from history
+            self.history = [m for m in self.history if m.get("role") != "system"]
+
+        elif self.sdk == "openai":
+            # Ensure system prompt is in history (only if not already there)
+            if self.system and not any(m.get("role") == "system" for m in self.history):
+                self.history.insert(0, {"role": "system", "content": self.system})
+
         else:
-            self.logger.warning(f"No normalizer available for SDK: {self.sdk}")
-            # Fallback to a simple conversion for unknown SDKs
-            for msg in self.session_history:
-                self._generic_normalize_message(msg)
+            self.logger.warning(f"[NORMALIZATION] No system handling logic for SDK '{self.sdk}'")
 
-
-    def _openai_normalizer(self):
+    def _normalizer(self, sdk=None, full_normalize=False, messages=None):
         """
-        Convert standardized session_history to OpenAI-compatible format in self.history.
+        Central message normalization orchestrator that delegates to SDK-specific normalizers.
+
+        This method determines which SDK-specific normalizer to use and manages when
+        normalization should occur.
+
+        Args:
+            sdk (str, optional): Target SDK to normalize to. Defaults to self.sdk.
+            full_normalize (bool): If True, forces normalization even if SDK hasn't changed.
+            messages (list, optional): Specific messages to normalize instead of self.history.
+                                      Returns normalized messages without changing self.history.
+
+        Returns:
+            list: Normalized messages if 'messages' parameter was provided,
+                  otherwise None (and self.history is modified in-place).
         """
-        # For OpenAI, we need to include system message in the history
-        # and convert tool calls/results to OpenAI format
+        # Determine target SDK
+        target_sdk = sdk or self.sdk
 
-        # First, find and add the system message if present
-        for msg in self.session_history:
-            if msg["role"] == "system":
-                self.history.append({
-                    "role": "system",
-                    "content": msg["content"]
-                })
-                break
-        
-        # If no system message was found but we have a system prompt, add it
-        if not any(m["role"] == "system" for m in self.history) and self.system:
-            self.history.append({
-                "role": "system",
-                "content": self.system
-            })
-        
-        # Process all non-system messages
-        for msg in self.session_history:
-            if msg["role"] == "system":
-                continue  # Skip system messages, already handled
-            
-            # Handle different message types
-            if msg["role"] == "user":
-                # User messages are straightforward
-                self.history.append({
-                    "role": "user",
-                    "content": msg["content"]
-                })
-            
-            elif msg["role"] == "assistant":
-                # For assistant messages, we need to handle potential tool calls
-                if "metadata" in msg and msg["metadata"].get("tool_info"):
-                    # This is an assistant message with tool calls
-                    tool_info = msg["metadata"]["tool_info"]
-                    
-                    # Create OpenAI assistant message with tool calls
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": msg["content"] if isinstance(msg["content"], str) else "",
-                        "tool_calls": [{
-                            "id": tool_info["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tool_info["name"],
-                                "arguments": json.dumps(tool_info["arguments"]) if isinstance(tool_info["arguments"], dict) else tool_info["arguments"]
-                            }
-                        }]
-                    }
-                    self.history.append(assistant_msg)
-                else:
-                    # Regular assistant message
-                    self.history.append({
-                        "role": "assistant",
-                        "content": msg["content"]
-                    })
-            
-            elif msg["role"] == "tool":
-                # Tool response messages
-                if "metadata" in msg and "tool_info" in msg["metadata"]:
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": msg["metadata"]["tool_info"]["id"],
-                        "content": json.dumps(msg["content"]) if isinstance(msg["content"], (dict, list)) else msg["content"]
-                    }
-                    self.history.append(tool_msg)
+        # Check if SDK-specific normalizer exists
+        normalizer_method = getattr(self, f"_{target_sdk}_normalizer", None)
+        if not normalizer_method:
+            self.logger.warning(f"No normalizer defined for SDK '{target_sdk}'. Messages may not be properly formatted.")
+            # Return messages as-is if no normalizer exists
+            return messages if messages is not None else None
 
+        # If specific messages provided, normalize and return them without changing self.history
+        if messages is not None:
+            return normalizer_method(messages)
 
-    def _anthropic_normalizer(self):
+        # Skip normalization if SDK hasn't changed and full normalize not requested
+        if hasattr(self, '_last_normalized_sdk') and self._last_normalized_sdk == target_sdk and not full_normalize:
+            return
+
+        # Store current SDK for future comparisons
+        self._last_normalized_sdk = target_sdk
+
+        # Normalize history in place
+        self.history = normalizer_method(self.history)
+        self._log(f"[NORMALIZER] Normalized message history to {target_sdk} format ({len(self.history)} messages)")
+
+        return None
+
+    def _openai_normalizer(self, messages):
         """
-        Convert standardized session_history to Anthropic-compatible format in self.history.
+        Normalize messages to OpenAI API format.
+
+        Converts various message formats (including Anthropic's) to OpenAI's expected format.
+
+        Args:
+            messages (list): Messages to normalize
+
+        Returns:
+            list: Messages normalized to OpenAI format
         """
-        # For Anthropic, we don't include system message in the history
-        # and need to handle content blocks for tool use/results
+        # Create a new list for normalized messages
+        normalized = []
 
-        # Process all non-system messages
-        current_tool_use_id = None
+        # Handle system messages first
+        system_content = self.system
+        system_msg_found = False
 
-        for msg in self.session_history:
-            if msg["role"] == "system":
-                # Store system prompt separately
-                self.system = msg["content"]
+        # First pass - extract system message and remove duplicates
+        for msg in messages:
+            if msg.get("role") == "system":
+                if not system_msg_found:
+                    system_content = msg.get("content", system_content)
+                    system_msg_found = True
+                # Skip system messages in this pass
                 continue
+            normalized.append(msg)
 
-            # Handle different message types
-            if msg["role"] == "user":
-                # User messages - check if it contains tool results
-                if "metadata" in msg and "tool_info" in msg["metadata"] and msg["metadata"]["tool_info"].get("result"):
-                    # This is a tool result message
-                    tool_info = msg["metadata"]["tool_info"]
+        # Start with system message if available
+        result = []
+        if system_content:
+            result.append({"role": "system", "content": system_content})
 
-                    # Create Anthropic tool result format
-                    tool_result_msg = {
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_info["id"],
-                            "content": json.dumps(tool_info["result"]) if isinstance(tool_info["result"], (dict, list)) else str(tool_info["result"])
-                        }]
-                    }
-                    self.history.append(tool_result_msg)
+        # Process each message for OpenAI format
+        for msg in normalized:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # Handle Anthropic-style assistant messages with content blocks
+            if role == "assistant" and isinstance(content, list):
+                text_content = ""
+                tool_calls = []
+
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_content += block.get("text", "")
+                        elif block.get("type") == "tool_use":
+                            # Convert Anthropic tool_use to OpenAI tool_calls
+                            tool_id = block.get("id")
+                            name = block.get("name", "")
+                            input_data = block.get("input", {})
+
+                            # Format arguments as JSON string for OpenAI
+                            if isinstance(input_data, dict):
+                                args_str = json.dumps(input_data)
+                            else:
+                                args_str = str(input_data)
+
+                            tool_calls.append({
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": args_str
+                                }
+                            })
+
+                # Create OpenAI assistant message
+                openai_msg = {
+                    "role": "assistant",
+                    "content": text_content
+                }
+
+                if tool_calls:
+                    openai_msg["tool_calls"] = tool_calls
+
+                result.append(openai_msg)
+
+            # Handle Anthropic-style user messages with tool results
+            elif role == "user" and isinstance(content, list):
+                tool_results = [item for item in content if isinstance(item, dict) and item.get("type") == "tool_result"]
+
+                if tool_results:
+                    # Create separate tool messages for each tool result
+                    for tool_result in tool_results:
+                        tool_msg = {
+                            "role": "tool",
+                            "content": tool_result.get("content", ""),
+                            "tool_call_id": tool_result.get("tool_use_id")
+                        }
+                        result.append(tool_msg)
                 else:
-                    # Regular user message
-                    self.history.append({
-                        "role": "user",
-                        "content": msg["content"]
-                    })
+                    # For non-tool user content, convert to string if needed
+                    text_content = ""
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_content += item.get("text", "")
+                        elif isinstance(item, str):
+                            text_content += item
 
-            elif msg["role"] == "assistant":
-                # For assistant messages, check for tool use
-                if "metadata" in msg and "tool_info" in msg["metadata"]:
-                    # This is an assistant message with tool use
-                    tool_info = msg["metadata"]["tool_info"]
-                    current_tool_use_id = tool_info["id"]
-
-                    # Build content blocks
-                    content_blocks = []
-
-                    # Add text content if present
-                    if msg["content"]:
-                        content_blocks.append({
-                            "type": "text",
-                            "text": msg["content"] if isinstance(msg["content"], str) else ""
+                    if text_content:
+                        result.append({
+                            "role": "user",
+                            "content": text_content
                         })
 
-                    # Add tool use block
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tool_info["id"],
-                        "name": tool_info["name"],
-                        "input": tool_info["arguments"] if isinstance(tool_info["arguments"], dict) else json.loads(tool_info["arguments"])
-                    })
+            # Handle OpenAI-specific messages (already correctly formatted)
+            elif role == "assistant" and msg.get("tool_calls"):
+                # Already in OpenAI format with tool calls
+                result.append(msg)
 
-                    # Create Anthropic assistant message with tool use
-                    self.history.append({
-                        "role": "assistant",
-                        "content": content_blocks
-                    })
-                else:
-                    # Regular assistant message
-                    self.history.append({
-                        "role": "assistant",
-                        "content": msg["content"]
-                    })
+            elif role == "tool" and msg.get("tool_call_id"):
+                # Already in OpenAI format as tool response
+                result.append(msg)
 
-            elif msg["role"] == "tool":
-                # Tool messages in standard format get converted to user messages with tool_result
-                if "metadata" in msg and "tool_info" in msg["metadata"]:
-                    tool_info = msg["metadata"]["tool_info"]
-
-                    # Create Anthropic tool result message
-                    tool_result_msg = {
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_info["id"],
-                            "content": json.dumps(msg["content"]) if isinstance(msg["content"], (dict, list)) else str(msg["content"])
-                        }]
-                    }
-                    self.history.append(tool_result_msg)
-
-    def _openai_normalize_message(self, msg):
-        """Normalize a single message to OpenAI format and add to history."""
-        role = msg.get("role")
-        content = msg.get("content")
-        
-        if role == "system":
-            self.history.append({
-                "role": "system",
-                "content": content
-            })
-            
-        elif role == "user":
-            self.history.append({
-                "role": "user",
-                "content": content
-            })
-            
-        elif role == "assistant":
-            # For assistant messages, handle potential tool calls
-            if "metadata" in msg and msg["metadata"].get("tool_info"):
-                # This is an assistant message with tool calls
-                tool_info = msg["metadata"]["tool_info"]
-                
-                # Create OpenAI assistant message with tool calls
-                try:
-                    arguments = tool_info.get("arguments", {})
-                    arguments_str = json.dumps(arguments) if isinstance(arguments, dict) else arguments
-                except:
-                    arguments_str = str(arguments)
-                    
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": content if isinstance(content, str) else "",
-                    "tool_calls": [{
-                        "id": tool_info["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tool_info["name"],
-                            "arguments": arguments_str
-                        }
-                    }]
-                }
-                self.history.append(assistant_msg)
+            # Regular messages that don't need special handling
             else:
-                # Regular assistant message
-                self.history.append({
-                    "role": "assistant",
+                # Convert to string content if necessary
+                if not isinstance(content, str) and content is not None:
+                    content = json.dumps(content)
+
+                result.append({
+                    "role": role,
                     "content": content
                 })
-            
-        elif role == "tool":
-            # Tool response messages
-            if "metadata" in msg and "tool_info" in msg["metadata"]:
-                tool_info = msg["metadata"]["tool_info"]
-                tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": tool_info["id"],
-                    "content": json.dumps(content) if isinstance(content, (dict, list)) else str(content)
-                }
-                self.history.append(tool_msg)
 
-    def _anthropic_normalize_message(self, msg):
-        """Normalize a single message to Anthropic format and add to history."""
-        role = msg.get("role")
-        content = msg.get("content")
-        
-        if role == "system":
-            # Store system prompt separately, not in history for Anthropic
-            self.system = content
-            
-        elif role == "user":
-            # User messages - check if it contains tool results
-            if "metadata" in msg and "tool_info" in msg["metadata"]:
-                tool_info = msg["metadata"]["tool_info"]
-                # Check for result or directly use content
-                result_content = tool_info.get("result", content)
-                
-                # Create Anthropic tool result format
-                try:
-                    result_str = json.dumps(result_content) if isinstance(result_content, (dict, list)) else str(result_content)
-                except:
-                    result_str = str(result_content)
-                    
-                tool_result_msg = {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_info["id"],
-                        "content": result_str
-                    }]
-                }
-                self.history.append(tool_result_msg)
-            else:
-                # Regular user message
-                self.history.append({
-                    "role": "user",
-                    "content": content
-                })
-                
-        elif role == "assistant":
-            # For assistant messages, check for tool use
-            if "metadata" in msg and "tool_info" in msg["metadata"]:
-                # This is an assistant message with tool use
-                tool_info = msg["metadata"]["tool_info"]
-                
-                # Build content blocks
-                content_blocks = []
-                
-                # Add text content if present
-                if content:
-                    content_blocks.append({
-                        "type": "text",
-                        "text": content if isinstance(content, str) else ""
-                    })
-                    
-                # Add tool use block - safely convert arguments
-                try:
-                    # Parse arguments to ensure it's a dictionary
-                    if isinstance(tool_info["arguments"], str):
-                        try:
-                            args_dict = json.loads(tool_info["arguments"])
-                        except json.JSONDecodeError:
-                            args_dict = {"text": tool_info["arguments"]}
-                    else:
-                        args_dict = tool_info["arguments"]
-                except:
-                    args_dict = {"error": "Failed to parse arguments"}
-                    
-                content_blocks.append({
-                    "type": "tool_use",
-                    "id": tool_info["id"],
-                    "name": tool_info["name"],
-                    "input": args_dict
-                })
-                
-                # Create Anthropic assistant message with tool use
-                self.history.append({
-                    "role": "assistant",
-                    "content": content_blocks
-                })
-            else:
-                # Regular assistant message
-                self.history.append({
-                    "role": "assistant",
-                    "content": content
-                })
-                
-        elif role == "tool":
-            # Tool messages in standard format get converted to user messages with tool_result
-            if "metadata" in msg and "tool_info" in msg["metadata"]:
-                tool_info = msg["metadata"]["tool_info"]
-                
-                try:
-                    result_str = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
-                except:
-                    result_str = str(content)
-                    
-                # Create Anthropic tool result message
-                tool_result_msg = {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_info["id"],
-                        "content": result_str
-                    }]
-                }
-                self.history.append(tool_result_msg)
+        return result
 
-    def _generic_normalize_message(self, msg):
-        """Generic normalizer for unknown SDKs."""
-        role = msg.get("role")
-        content = msg.get("content")
-        
-        if role in ["user", "assistant", "system"]:
-            self.history.append({
-                "role": role,
-                "content": content
-            })
-
-    def track_token_usage(self):
-        """Track and return token usage across the conversation history.
-        
-        Returns:
-            dict: Dictionary containing current token counts, limits, and history.
-        """
-        if not hasattr(self, "_token_history"):
-            self._token_history = []
-        
-        # Count current tokens
-        current_count = self._count_tokens(self.history)
-        
-        # Add to history
-        timestamp = datetime.now(timezone.utc).isoformat()
-        self._token_history.append({
-            "timestamp": timestamp,
-            "count": current_count,
-            "limit": self.context_length,
-            "provider": self.provider,
-            "model": self.model
-        })
-        
-        # Keep only the last 100 measurements to avoid unlimited growth
-        if len(self._token_history) > 100:
-            self._token_history = self._token_history[-100:]
-        
-        # Return current tracking info
-        return {
-            "current": current_count,
-            "limit": self.context_length,
-            "percentage": round((current_count / self.context_length) * 100, 1) if self.context_length else 0,
-            "history": self._token_history[-10:],  # Return last 10 measurements
-            "provider": self.provider,
-            "model": self.model
-        }
-
-    def get_message_token_breakdown(self):
-        """Analyze token usage by message type and provide a detailed breakdown.
-        
-        Returns:
-            dict: Token usage broken down by message types and roles.
-        """
-        breakdown = {
-            "total": 0,
-            "by_role": {
-                "system": 0,
-                "user": 0,
-                "assistant": 0,
-                "tool": 0
-            },
-            "by_type": {
-                "text": 0,
-                "tool_calls": 0,
-                "tool_results": 0
-            },
-            "messages": []
-        }
-        
-        # Analyze each message
-        for i, msg in enumerate(self.history):
-            msg_tokens = self._count_tokens([msg])
-            role = msg.get("role", "unknown")
-            
-            # Track by role
-            if role in breakdown["by_role"]:
-                breakdown["by_role"][role] += msg_tokens
-            
-            # Track by content type
-            if role == "assistant" and msg.get("tool_calls"):
-                breakdown["by_type"]["tool_calls"] += msg_tokens
-            elif role == "tool":
-                breakdown["by_type"]["tool_results"] += msg_tokens
-            else:
-                breakdown["by_type"]["text"] += msg_tokens
-            
-            # Add individual message data
-            breakdown["messages"].append({
-                "index": i,
-                "role": role,
-                "tokens": msg_tokens,
-                "has_tools": bool(msg.get("tool_calls") or msg.get("tool_use") or 
-                                (isinstance(msg.get("content"), list) and 
-                                 any(isinstance(c, dict) and c.get("type") in ["tool_use", "tool_result"] 
-                                     for c in msg.get("content", []))))
-            })
-            
-            # Update tota?
-            breakdown["total"] += msg_tokens
-        
-        return breakdown
 
 
 def run_bash_command(command: str, safe_mode: bool = True) -> Dict[str, Any]:
@@ -2569,7 +2105,6 @@ def main():
                 if user_input.startswith("/list"):
                     models = caller.list_models()
                     print(models)
-                    continue
                 elif not user_input:
                     continue
 
