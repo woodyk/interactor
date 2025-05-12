@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 #
 # File: setup.py
-# Author: Wadih Khairallah
+# Author: Ms. White 
 # Description: 
-# Created: 2025-05-05 16:54:44
-# Modified: 2025-05-05 17:58:10
+# Created: 2025-05-12 15:19:57
 
 from setuptools import setup, find_packages
 
@@ -13,12 +12,19 @@ def load_requirements(path="requirements.txt"):
     with open(path, encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 setup(
     name="interactor",
     version="0.1.0",
     description="Universal AI interaction library with session and tool support",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="Wadih Khairallah",
     author_email="woodyk@gmail.com",
+    url="https://github.com/woodyk/interactor",
+    license="MIT",
     packages=find_packages(),
     include_package_data=True,
     python_requires=">=3.8",
@@ -30,6 +36,12 @@ setup(
     },
     classifiers=[
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Developers",
+        "Topic :: Software Development :: Libraries :: Python Modules",
     ],
 )
+
