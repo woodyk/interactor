@@ -5,7 +5,7 @@
 # Description: EchoAI session manager with full CRUD and branching
 # Author: Ms. White
 # Created: 2025-05-02
-# Modified: 2025-05-05 18:15:47
+# Modified: 2025-05-13 16:04:13
 
 import os
 import json
@@ -244,55 +244,83 @@ class Session:
     # ---------------------------
 
     def branch(self, from_id: str, message_id: str, new_name: str) -> str:
-        """
-        Create a new session by branching from a specific message.
+        """Create a new session by branching from a specific message.
+
+        This method creates a new session that branches from an existing one at a specific
+        message point. The new session inherits all messages up to and including the
+        specified message, then starts fresh from there.
 
         Args:
-            from_id (str): ID of the base session.
-            message_id (str): Message ID to branch from.
-            new_name (str): Name of the new session.
+            from_id (str): ID of the source session to branch from.
+            message_id (str): ID of the message to branch at.
+            new_name (str): Name for the new branched session.
 
         Returns:
-            str: ID of the new session.
+            str: ID of the newly created branched session.
+
+        Raises:
+            ValueError: If the source session or message ID is not found.
         """
-        base = self._read_file(from_id)
-        index = next((i for i, m in enumerate(base["messages"]) if m.get("id") == message_id), None)
-        if index is None:
-            raise ValueError(f"Message ID {message_id} not found in session {from_id}.")
-        partial = base["messages"][:index + 1]
-        new_id = str(uuid.uuid4())
-        branch = {
-            "id": new_id,
-            "name": new_name,
-            "created": datetime.now(timezone.utc).isoformat(),
-            "parent": from_id,
-            "branch_point": message_id,
-            "tags": base.get("tags", []),
-            "summary": None,
-            "messages": partial
-        }
-        self._save_file(new_id, branch)
+        # Get source session
+        source = self._read_file(from_id)
+        if not source:
+            raise ValueError(f"Source session '{from_id}' not found")
+
+        # Find the branch point
+        branch_index = self.msg_index(from_id, message_id)
+        if branch_index is None:
+            raise ValueError(f"Message '{message_id}' not found in session '{from_id}'")
+
+        # Create new session
+        new_id = self.create(new_name, source.get("tags", []))
+        new_session = self._read_file(new_id)
+
+        # Copy messages up to branch point
+        new_session["messages"] = source["messages"][:branch_index + 1]
+        new_session["parent"] = from_id
+        new_session["branch_point"] = message_id
+
+        # Save and return
+        self._save_file(new_id, new_session)
         return new_id
 
     def summarize(self, interactor, session_id: str) -> str:
-        """
-        Summarize the conversation in a session using the Interactor.
+        """Generate a summary of the session using the provided interactor.
+
+        This method uses the AI interactor to analyze the session content and generate
+        a concise summary. The summary is stored in the session metadata and returned.
 
         Args:
-            interactor: An instance of the Interactor class with messaging methods.
+            interactor: An AI interactor instance capable of generating summaries.
             session_id (str): ID of the session to summarize.
 
         Returns:
-            str: Generated summary string.
+            str: The generated summary text.
+
+        Note:
+            The summary is automatically stored in the session metadata and can be
+            retrieved later using load_full().
         """
-        clean_messages = self.load(session_id)
-        summary_prompt = "Summarize the following interaction in 3-4 sentences."
-        interactor.messages_flush()
-        interactor.messages_add(role="system", content=summary_prompt)
-        for msg in clean_messages:
-            interactor.messages_add(**msg)
-        summary = interactor.interact(user_input=None, stream=False, quiet=True)
-        self.update(session_id, "summary", summary)
+        session = self._read_file(session_id)
+        if not session:
+            return ""
+
+        # Get clean message list
+        messages = self.load(session_id)
+        if not messages:
+            return ""
+
+        # Generate summary
+        summary = interactor.interact(
+            "Summarize this conversation in 2-3 sentences:",
+            tools=False,
+            stream=False,
+            markdown=False
+        )
+
+        # Store and return
+        session["summary"] = summary
+        self._save_file(session_id, session)
         return summary
 
     # ---------------------------
@@ -300,106 +328,163 @@ class Session:
     # ---------------------------
 
     def search(self, query: str, session_id: Optional[str] = None) -> List[Dict]:
-        """
-        Search messages for a text query across sessions or within a specific session.
+        """Search for messages containing the query text within a session or all sessions.
+
+        This method performs a case-insensitive text search across message content.
+        If a session_id is provided, only searches within that session. Otherwise,
+        searches across all sessions.
 
         Args:
-            query (str): Search term (case-insensitive).
-            session_id (str, optional): If specified, restrict search to that session.
+            query (str): Text to search for.
+            session_id (Optional[str]): Optional session ID to limit search scope.
 
         Returns:
-            List[Dict]: List of session dicts containing only matching messages.
+            List[Dict]: List of matching messages with their session context.
+            Each dict contains:
+                - session_id: ID of the containing session
+                - message: The matching message
+                - context: Surrounding messages for context
         """
-        result = []
-        sessions = [session_id] if session_id else [f.stem for f in self.path.glob("*.json")]
+        results = []
+        query = query.lower()
 
-        for sid in sessions:
-            try:
-                data = self._read_file(sid)
-                matching = [
-                    msg for msg in data.get("messages", [])
-                    if query.lower() in (msg.get("content") or "").lower()
-                ]
-                if matching:
-                    result.append({
-                        "id": data["id"],
-                        "name": data["name"],
-                        "created": data["created"],
-                        "parent": data.get("parent"),
-                        "branch_point": data.get("branch_point"),
-                        "tags": data.get("tags", []),
-                        "summary": data.get("summary"),
-                        "messages": matching
-                    })
-            except Exception:
+        # Determine search scope
+        if session_id:
+            sessions = [(session_id, self._read_file(session_id))]
+        else:
+            sessions = [(f.stem, self._read_file(f.stem)) for f in self.path.glob("*.json")]
+
+        # Search each session
+        for sid, session in sessions:
+            if not session:
                 continue
-        return result
+
+            messages = session.get("messages", [])
+            for i, msg in enumerate(messages):
+                content = str(msg.get("content", "")).lower()
+                if query in content:
+                    # Get context (2 messages before and after)
+                    start = max(0, i - 2)
+                    end = min(len(messages), i + 3)
+                    context = messages[start:end]
+
+                    results.append({
+                        "session_id": sid,
+                        "message": msg,
+                        "context": context
+                    })
+
+        return results
 
     def search_meta(self, query: str) -> List[Dict]:
-        """
-        Search session metadata fields: name, tags, and summary.
+        """Search session metadata (name, tags, summary) for matching sessions.
+
+        This method performs a case-insensitive search across session metadata fields
+        including name, tags, and summary. It returns matching sessions with their
+        full metadata.
 
         Args:
-            query (str): Case-insensitive search term.
+            query (str): Text to search for in metadata.
 
         Returns:
-            List[Dict]: Matching sessions (without message contents).
+            List[Dict]: List of matching session metadata dictionaries.
+            Each dict contains:
+                - id: Session ID
+                - name: Session name
+                - created: Creation timestamp
+                - tags: List of tags
+                - summary: Session summary if available
         """
-        result = []
+        results = []
+        query = query.lower()
+
         for file in self.path.glob("*.json"):
             try:
-                data = self._read_file(file.stem)
-                searchable = " ".join([
-                    data.get("name", ""),
-                    data.get("summary", "") or "",
-                    " ".join(data.get("tags", []))
-                ]).lower()
-                if query.lower() in searchable:
-                    result.append({
-                        "id": data["id"],
-                        "name": data["name"],
-                        "created": data["created"],
-                        "parent": data.get("parent"),
-                        "branch_point": data.get("branch_point"),
-                        "tags": data.get("tags", []),
-                        "summary": data.get("summary")
-                    })
+                with open(file, "r") as f:
+                    session = json.load(f)
+                    
+                    # Check metadata fields
+                    name = str(session.get("name", "")).lower()
+                    tags = [str(t).lower() for t in session.get("tags", [])]
+                    summary = str(session.get("summary", "")).lower()
+                    
+                    if (query in name or
+                        any(query in tag for tag in tags) or
+                        query in summary):
+                        results.append({
+                            "id": session.get("id"),
+                            "name": session.get("name"),
+                            "created": session.get("created"),
+                            "tags": session.get("tags", []),
+                            "summary": session.get("summary")
+                        })
             except Exception:
                 continue
-        return result
+
+        return sorted(results, key=lambda x: x["created"], reverse=True)
 
     # ---------------------------
     # Internal I/O
     # ---------------------------
 
     def _read_file(self, session_id: str) -> Dict:
-        """
-        Load a session file from disk.
+        """Read and parse a session file from disk.
+
+        This internal method handles reading and parsing session files.
+        It ensures proper error handling and returns an empty session
+        structure if the file doesn't exist or is invalid.
 
         Args:
-            session_id (str): ID of the session file to read.
+            session_id (str): ID of the session to read.
 
         Returns:
-            Dict: Parsed session data.
-
-        Raises:
-            FileNotFoundError: If the session file doesn't exist.
+            Dict: Session data dictionary or empty session structure.
         """
         file = self.path / f"{session_id}.json"
         if not file.exists():
-            raise FileNotFoundError(f"Session {session_id} not found.")
-        with open(file, "r") as f:
-            return json.load(f)
+            return {
+                "id": session_id,
+                "name": "New Session",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "messages": []
+            }
+
+        try:
+            with open(file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {
+                "id": session_id,
+                "name": "New Session",
+                "created": datetime.now(timezone.utc).isoformat(),
+                "messages": []
+            }
 
     def _save_file(self, session_id: str, data: Dict):
-        """
-        Write session data to disk.
+        """Write session data to disk.
+
+        This internal method handles writing session data to disk.
+        It ensures proper error handling and atomic writes.
 
         Args:
-            session_id (str): ID of the session file to write.
-            data (Dict): Session content to save.
+            session_id (str): ID of the session to save.
+            data (Dict): Session data to write.
+
+        Raises:
+            OSError: If the file cannot be written.
         """
         file = self.path / f"{session_id}.json"
-        with open(file, "w") as f:
-            json.dump(data, f, indent=2)
+        temp_file = file.with_suffix(".tmp")
+
+        try:
+            # Write to temporary file first
+            with open(temp_file, "w") as f:
+                json.dump(data, f, indent=2)
+
+            # Atomic rename
+            temp_file.replace(file)
+        except Exception as e:
+            if temp_file.exists():
+                temp_file.unlink()
+            raise OSError(f"Failed to save session '{session_id}': {e}")
 

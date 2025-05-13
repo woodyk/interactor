@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-13 15:51:47
+# Modified: 2025-05-13 15:59:44
 
 import os
 import re
@@ -44,7 +44,7 @@ import openai
 from openai import OpenAIError, RateLimitError, APIConnectionError
 
 import anthropic
-from anthropic import Anthropic, AsyncAnthropic
+from anthropic import Anthropic
 
 from rich.prompt import Confirm
 from rich.console import Console
@@ -196,6 +196,16 @@ class Interactor:
 
 
     def _log(self, message: str, level: str = "info"):
+        """Log a message to the configured logging handlers.
+
+        This internal method handles logging to both console and file handlers
+        if configured. It respects the logging level and only logs if logging
+        is enabled.
+
+        Args:
+            message (str): The message to log
+            level (str): Logging level - one of "debug", "info", "warning", "error"
+        """
         if self._log_enabled:
             getattr(self.logger, level)(message)
 
@@ -475,7 +485,19 @@ class Interactor:
             return {"type": "object"}
         
         def _get_json_type(value):
-            """Get the JSON Schema type name for a Python value."""
+            """Get the JSON Schema type name for a Python value.
+
+            This helper function maps Python types to their corresponding
+            JSON Schema type names. It handles basic types and provides
+            sensible defaults for complex types.
+
+            Args:
+                value: The Python value to get the JSON type for
+
+            Returns:
+                str: The JSON Schema type name ('string', 'number', 'boolean',
+                     'array', 'object', or 'object' as default)
+            """
             if isinstance(value, str):
                 return "string"
             elif isinstance(value, bool):
@@ -797,6 +819,24 @@ class Interactor:
 
 
     async def _retry_with_backoff(self, func: Callable, *args, **kwargs):
+        """Execute a function with exponential backoff retry logic.
+
+        This method implements a robust retry mechanism for API calls with
+        exponential backoff. It handles rate limits, connection errors, and
+        other transient failures. If all retries fail, it will attempt to
+        switch to a fallback model if configured.
+
+        Args:
+            func (Callable): The async function to execute
+            *args: Positional arguments to pass to the function
+            **kwargs: Keyword arguments to pass to the function
+
+        Returns:
+            The result of the function call if successful
+
+        Raises:
+            Exception: If all retries fail and no fallback model is available
+        """
         for attempt in range(self.max_retries + 1):
             try:
                 return await func(*args, **kwargs)
@@ -1004,6 +1044,19 @@ class Interactor:
         # Create a token stream class using a thread-safe queue
         class TokenStream:
             def __init__(self, interactor, user_input, tools, tool_suppress, timeout):
+                """Initialize a new TokenStream instance.
+
+                This class provides a context manager for streaming token responses
+                from the AI model. It handles asynchronous token delivery, tool call
+                suppression, and timeout management.
+
+                Args:
+                    interactor: The parent Interactor instance
+                    user_input: The user's input text
+                    tools: Whether tool calling is enabled
+                    tool_suppress: Whether to suppress tool-related status messages
+                    timeout: Maximum time in seconds to wait for stream completion
+                """
                 self.interactor = interactor
                 self.user_input = user_input
                 self.tools = tools
@@ -1014,12 +1067,35 @@ class Interactor:
                 self.result = None
                 self.error = None
                 self.completed = False
-                
+
             def __enter__(self):
+                """Enter the context manager and start the streaming process.
+
+                This method initializes the streaming worker thread and returns
+                self for iteration. The worker thread handles the actual API
+                communication and token delivery.
+
+                Returns:
+                    TokenStream: Self for iteration
+                """
                 # Start the thread for async interaction
                 def stream_worker():
+                    """Worker thread that handles the streaming interaction.
+
+                    This internal function runs in a separate thread to handle
+                    the asynchronous API communication and token delivery.
+                    """
                     # Define output callback to put tokens in queue
                     def callback(text):
+                        """Process and queue incoming text tokens.
+
+                        This internal function handles incoming text chunks,
+                        optionally filtering tool-related messages, and adds
+                        them to the token queue.
+
+                        Args:
+                            text: The text chunk to process and queue
+                        """
                         # Filter out tool messages if requested
                         if self.tool_suppress:
                             try:
@@ -1073,9 +1149,25 @@ class Interactor:
                 return self
             
             def __iter__(self):
+                """Return self as an iterator.
+
+                Returns:
+                    TokenStream: Self for iteration
+                """
                 return self
             
             def __next__(self):
+                """Get the next token from the stream.
+
+                This method implements the iterator protocol, retrieving the next
+                token from the queue with timeout handling.
+
+                Returns:
+                    str: The next token from the stream
+
+                Raises:
+                    StopIteration: When the stream is complete or times out
+                """
                 # Get next token from queue with timeout to prevent hanging
                 try:
                     token = self.token_queue.get(timeout=self.timeout)
@@ -1095,6 +1187,19 @@ class Interactor:
                     raise StopIteration
                 
             def __exit__(self, exc_type, exc_val, exc_tb):
+                """Exit the context manager and clean up resources.
+
+                This method handles cleanup when the context manager is exited,
+                including thread cleanup and message history updates.
+
+                Args:
+                    exc_type: The exception type if an exception was raised
+                    exc_val: The exception value if an exception was raised
+                    exc_tb: The exception traceback if an exception was raised
+
+                Returns:
+                    bool: False to not suppress any exceptions
+                """
                 # Clean up resources
                 if self.thread and self.thread.is_alive():
                     self.thread.join(timeout=2.0)
@@ -1134,7 +1239,6 @@ class Interactor:
         
         # Initialize variables for iteration tracking
         full_content = ""
-        tool_enabled = self.tools_enabled and self.tools_supported and tools
         max_iterations = 5  # Prevent infinite loops
         iterations = 0
         
@@ -1283,7 +1387,7 @@ class Interactor:
                 self.async_client.chat.completions.create,
                 **params
             )
-        except Exception as e:
+        except Exception:
             self.logger.error(f"[OPENAI ERROR RUNNER]: {traceback.format_exc()}")
             raise
 
@@ -1294,7 +1398,6 @@ class Interactor:
         if stream and hasattr(response, "__aiter__"):
             async for chunk in response:
                 delta = getattr(chunk.choices[0], "delta", None)
-                finish_reason = getattr(chunk.choices[0], "finish_reason", None)
 
                 # Handle content chunks
                 if hasattr(delta, "content") and delta.content is not None:
@@ -1611,7 +1714,15 @@ class Interactor:
 
 
     def _setup_encoding(self):
-        """Set up the token encoding based on the current model."""
+        """Initialize the token encoding system for the current model.
+
+        This method sets up the appropriate tokenizer based on the current
+        model provider. For OpenAI models, it attempts to use the model-specific
+        tokenizer, falling back to cl100k_base if not available. For other
+        providers, it uses cl100k_base as a default.
+
+        The encoding is used for token counting and context management.
+        """
         try:
             if self.provider == "openai":
                 try:
@@ -1825,18 +1936,28 @@ class Interactor:
 
 
     def _cycle_messages(self):
-        """
-        Intelligently trim the message history to fit within the allowed context length.
+        """Intelligently trim the message history to fit within the allowed context length.
 
-        This method implements a sophisticated trimming strategy:
+        This method implements a sophisticated trimming strategy that:
         1. Always preserves system messages
         2. Always keeps the most recent complete conversation turn
         3. Prioritizes keeping tool call chains intact
         4. Preserves important context from earlier exchanges
         5. Aggressively prunes redundant information before essential content
 
+        The method uses a multi-pass approach:
+        1. First pass: Identify critical messages that must be kept
+        2. Second pass: Calculate token counts for each message
+        3. Third pass: Keep important tool chains intact
+        4. Fourth pass: Fill remaining space with recent messages
+
         Returns:
-            bool: True if all messages were trimmed (context exceeded), False otherwise.
+            bool: True if all messages were trimmed (context exceeded),
+                 False if trimming was successful and context is within limits
+
+        Note:
+            This method maintains both session_history and history in sync,
+            ensuring proper SDK-specific formatting is preserved.
         """
         # Check if we need to trim
         token_count = self._count_tokens(self.history)
@@ -1848,7 +1969,6 @@ class Interactor:
         self._log(f"[TRIM] Starting message cycling: {token_count} tokens exceeds {self.context_length} limit", level="info")
 
         # We'll need to track tokens as we reconstruct the history
-        remaining_tokens = token_count
         target_tokens = max(self.context_length * 0.8, self.context_length - 1000)  # Target 80% or 1000 less than max
 
         # First pass: identify critical messages we must keep
@@ -2141,7 +2261,20 @@ class Interactor:
 
 
     def messages_system(self, prompt: str):
-        """Set or retrieve the current system prompt."""
+        """Set or retrieve the current system prompt.
+
+        This method manages the system prompt that guides the AI's behavior.
+        It can be used to both set a new system prompt and retrieve the current one.
+        When setting a new prompt, it updates the system message in the conversation
+        history and persists it to the session if enabled.
+
+        Args:
+            prompt (str): The new system prompt to set. If empty or None,
+                         returns the current system prompt without changes.
+
+        Returns:
+            str: The current system prompt after any updates
+        """
         if not isinstance(prompt, str) or not prompt:
             return self.system
 
@@ -2200,10 +2333,25 @@ class Interactor:
 
 
     def session_load(self, session_id: Optional[str]):
-        """Load and normalize messages for a specific session."""
+        """Load and normalize messages for a specific session.
+
+        This method loads a conversation session from persistent storage and
+        normalizes the messages to the current SDK format. It handles system
+        messages, tool calls, and maintains message ordering. If loading fails,
+        it resets to an empty session with the default system prompt.
+
+        Args:
+            session_id (Optional[str]): The ID of the session to load.
+                                      If None, resets to in-memory mode.
+
+        Note:
+            This method will update both session_history and history to match
+            the loaded session's state. It also ensures proper SDK-specific
+            message formatting.
+        """
         self.session_id = session_id
         self._last_session_id = session_id
-        
+
         if self.session_enabled and session_id:
             try:
                 # Load raw session data
@@ -2282,10 +2430,17 @@ class Interactor:
 
 
     def session_reset(self):
-        """
-        Reset the current session state and reinitialize to default system prompt.
+        """Reset the current session state and reinitialize to default system prompt.
 
-        Clears history, disables session ID tracking, and returns to in-memory mode.
+        This method performs a complete reset of the conversation state:
+        1. Clears all message history
+        2. Disables session ID tracking
+        3. Returns to in-memory mode
+        4. Reinitializes with the default system prompt
+
+        The reset is useful for starting fresh conversations or recovering
+        from error states. It maintains the basic system configuration while
+        clearing all conversation context.
         """
         self.session_id = None
         self._last_session_id = None
@@ -2307,15 +2462,22 @@ class Interactor:
 
 
     def _normalizer(self, force=False, new_message_only=False):
-        """
-        Central normalization function that transforms the standard session_history
-        into the SDK-specific format needed in self.history.
-        
+        """Central normalization function for message format conversion.
+
+        This method transforms the standardized session_history into the
+        SDK-specific format needed in self.history. It handles different
+        message types (system, user, assistant, tool) and their various
+        formats across different SDKs.
+
         Args:
             force (bool): If True, always normalize even if SDK hasn't changed.
                          Default is False, which only normalizes on SDK change.
             new_message_only (bool): If True, only normalize the most recent message
                                    for efficiency when adding single messages.
+
+        Note:
+            This method is the central point for message format conversion and
+            ensures consistency between session storage and API communication.
         """
         # Skip normalization if SDK hasn't changed and force is False
         if not force and hasattr(self, '_last_sdk') and self._last_sdk == self.sdk:
@@ -2354,8 +2516,17 @@ class Interactor:
 
 
     def _openai_normalizer(self):
-        """
-        Convert standardized session_history to OpenAI-compatible format in self.history.
+        """Convert standardized session_history to OpenAI-compatible format.
+
+        This method transforms the internal message format into the structure
+        required by the OpenAI API. It handles:
+        - System messages at the start of history
+        - User messages with plain text
+        - Assistant messages with optional tool calls
+        - Tool response messages with tool_call_id
+
+        The resulting format matches OpenAI's chat completion API requirements
+        for both regular messages and function calling.
         """
         # For OpenAI, we need to include system message in the history
         # and convert tool calls/results to OpenAI format
@@ -2421,12 +2592,21 @@ class Interactor:
 
 
     def _anthropic_normalizer(self):
-        """
-        Convert standardized session_history to Anthropic-compatible format in self.history.
+        """Convert standardized session_history to Anthropic-compatible format.
+
+        This method transforms the internal message format into the structure
+        required by the Anthropic API. It handles:
+        - System messages (stored separately, not in history)
+        - User messages with optional tool results
+        - Assistant messages with optional tool use
+        - Content blocks for structured responses
+
+        The resulting format matches Anthropic's message API requirements
+        for both regular messages and tool use.
         """
         # For Anthropic, we don't include system message in the history
         # but need to handle content blocks for tool use/results
-        
+
         # Start with empty history
         self.history = []
 
@@ -2468,7 +2648,6 @@ class Interactor:
                 if "metadata" in msg and "tool_info" in msg["metadata"]:
                     # This is an assistant message with tool use
                     tool_info = msg["metadata"]["tool_info"]
-                    current_tool_use_id = tool_info["id"]
 
                     # Build content blocks
                     content_blocks = []
@@ -2698,7 +2877,21 @@ class Interactor:
 
 
     def _generic_normalize_message(self, msg):
-        """Generic normalizer for unknown SDKs."""
+        """Generic normalizer for unknown SDKs.
+
+        This method provides a basic message normalization for SDKs that
+        don't have specific handling. It performs minimal conversion to
+        ensure basic message structure is maintained.
+
+        Args:
+            msg (dict): The message to normalize, containing at minimum:
+                       - role: Message role (user/assistant/system)
+                       - content: Message content
+
+        Note:
+            This is a fallback method and should be overridden for specific
+            SDK implementations when possible.
+        """
         role = msg.get("role")
         content = msg.get("content")
         
@@ -2712,8 +2905,26 @@ class Interactor:
     def track_token_usage(self):
         """Track and return token usage across the conversation history.
         
+        This method maintains a history of token usage measurements and provides
+        current usage statistics. It tracks:
+        - Current token count
+        - Context length limit
+        - Usage percentage
+        - Historical measurements
+        - Current provider and model info
+
         Returns:
-            dict: Dictionary containing current token counts, limits, and history.
+            dict: Dictionary containing:
+                - current: Current token count
+                - limit: Maximum context length
+                - percentage: Usage as percentage of limit
+                - history: Last 10 measurements with timestamps
+                - provider: Current provider name
+                - model: Current model name
+
+        Note:
+            The history is limited to the last 100 measurements to prevent
+            unbounded memory growth.
         """
         if not hasattr(self, "_token_history"):
             self._token_history = []
@@ -2749,8 +2960,26 @@ class Interactor:
     def get_message_token_breakdown(self):
         """Analyze token usage by message type and provide a detailed breakdown.
         
+        This method performs a detailed analysis of token usage across the
+        conversation history, breaking down usage by:
+        - Message role (system, user, assistant, tool)
+        - Content type (text, tool calls, tool results)
+        - Individual message statistics
+
         Returns:
-            dict: Token usage broken down by message types and roles.
+            dict: Token usage breakdown containing:
+                - total: Total tokens used
+                - by_role: Tokens used by each role
+                - by_type: Tokens used by content type
+                - messages: List of individual message stats including:
+                    - index: Message position
+                    - role: Message role
+                    - tokens: Tokens used
+                    - has_tools: Whether message contains tool calls
+
+        Note:
+            This analysis is useful for understanding token usage patterns
+            and optimizing conversation context.
         """
         breakdown = {
             "total": 0,
@@ -2834,8 +3063,7 @@ def run_bash_command(command: str, safe_mode: bool = True) -> Dict[str, Any]:
     
 
 def main():
-    """
-    Run the Interactor as a standalone AI chat client via CLI.
+    """Run the Interactor as a standalone AI chat client via CLI.
 
     This function sets up argument parsing, initializes the Interactor, registers tools,
     and enters a user interaction loop. It supports streaming, markdown, and tool calling
@@ -2854,6 +3082,9 @@ def main():
 
     Raises:
         SystemExit: On argparse errors or manual termination (e.g. KeyboardInterrupt).
+
+    Example:
+        $ python interactor.py --model "openai:gpt-4" --stream --markdown
     """
     parser = argparse.ArgumentParser(description='AI Chat Client')
     parser.add_argument('--model', default='openai:gpt-4o-mini',

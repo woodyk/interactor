@@ -3,3 +3,4 @@ openai
 rich
 tiktoken
 anthropic
+requests
