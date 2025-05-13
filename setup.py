@@ -5,10 +5,14 @@
 # Author: Ms. White 
 # Description: 
 # Created: 2025-05-12 15:19:57
+# Modified: 2025-05-12 15:59:35
 
+import os
 from setuptools import setup, find_packages
 
-def load_requirements(path="requirements.txt"):
+def load_requirements(filename="requirements.txt"):
+    here = os.path.abspath(os.path.dirname(__file__))
+    path = os.path.join(here, filename)
     with open(path, encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
@@ -16,7 +20,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="interactor",
+    name="ai-interactor",
     version="0.1.0",
     description="Universal AI interaction library with session and tool support",
     long_description=long_description,

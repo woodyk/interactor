@@ -8,21 +8,24 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-12 15:01:58
+# Modified: 2025-05-13 13:33:19
 
 import os
 import re
 import sys
 import json
+import time
 import uuid
-import subprocess
-import inspect
-import argparse
-import tiktoken
+import queue
 import asyncio
 import aiohttp
+import inspect
 import logging
+import argparse
+import tiktoken
 import traceback
+import threading
+import subprocess
 
 from typing import (
     Union,
@@ -66,10 +69,12 @@ class Interactor:
         fallback_model = "ollama:mistral-nemo:latest",
         tools: Optional[bool] = True,
         stream: bool = True,
+        quiet: bool = False,
         context_length: int = 128000,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         log_path: Optional[str] = None,
+        raw: Optional[bool] = False,
         session_enabled: bool = False,
         session_id: Optional[str] = None,
         session_path: Optional[str] = None
@@ -92,6 +97,8 @@ class Interactor:
             ValueError: If provider is not supported or API key is missing for non-Ollama providers.
         """
         self.system = "You are a helpful Assistant."
+        self.raw = raw
+        self.quiet = quiet
         self.logger = logging.getLogger(f"InteractorLogger_{id(self)}")
         self.logger.setLevel(logging.DEBUG)
         self.providers = {
@@ -187,9 +194,11 @@ class Interactor:
         self._setup_encoding()
         self.messages_add(role="system", content=self.system)
 
+
     def _log(self, message: str, level: str = "info"):
         if self._log_enabled:
             getattr(self.logger, level)(message)
+
 
     def _setup_client(
         self,
@@ -259,6 +268,7 @@ class Interactor:
         self._normalizer(force=True)
 
         self._log(f"[MODEL] Switched to {provider}:{model_name}")
+
 
     def _check_tool_support(self) -> bool:
         """Determine if the current model supports tool calling.
@@ -342,6 +352,7 @@ class Interactor:
         except Exception as e:
             self.logger.error(f"Tool support check failed for {self.provider}:{self.model} — {e}")
             return False
+
 
     def add_function(
         self,
@@ -576,17 +587,25 @@ class Interactor:
                 # Add to properties
                 properties[param_name] = schema
                 
-                # If no default, add to required list
+                # If no default value is provided, parameter is required
                 if param.default == inspect.Parameter.empty:
                     required.append(param_name)
+                    self._log(f"[TOOL] Parameter '{param_name}' is required", level="debug")
+                else:
+                    self._log(f"[TOOL] Parameter '{param_name}' has default value: {param.default}", level="debug")
                     
             except Exception as e:
                 self._log(f"[TOOL] Error processing parameter {param_name} for {function_name}: {e}", level="error")
                 # Add a basic object schema as fallback
                 properties[param_name] = {
-                    "type": "object",
+                    "type": "string",  # Default to string instead of object for better compatibility
                     "description": f"{param_name} parameter (type conversion failed)"
                 }
+                
+                # For parameters with no default value, mark as required even if processing failed
+                if param.default == inspect.Parameter.empty:
+                    required.append(param_name)
+                    self._log(f"[TOOL] Parameter '{param_name}' marked as required despite conversion failure", level="debug")
         
         # Apply schema extensions if provided
         if schema_extensions:
@@ -594,17 +613,23 @@ class Interactor:
                 if param_name in properties:
                     properties[param_name].update(extensions)
         
+        # Create parameters object with proper placement of 'required' field
+        parameters = {
+            "type": "object",
+            "properties": properties,
+        }
+        
+        # Only add required field if there are required parameters
+        if required:
+            parameters["required"] = required
+        
         # Build the final tool specification
         tool_spec = {
             "type": "function",
             "function": {
                 "name": function_name,
                 "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }
+                "parameters": parameters
             }
         }
         
@@ -618,8 +643,10 @@ class Interactor:
         # Make the function available as an attribute on the instance
         setattr(self, function_name, external_callable)
         
-        # Log the registration
+        # Log the registration with detailed information
         self._log(f"[TOOL] Registered function '{function_name}' with {len(properties)} parameters", level="info")
+        if required:
+            self._log(f"[TOOL] Required parameters: {required}", level="info")
         
         return function_name  # Return the name for reference
 
@@ -699,6 +726,7 @@ class Interactor:
             List[Dict[str, Any]]: List of registered functions.
         """
         return self.tools
+
 
     def list_models(
         self,
@@ -799,6 +827,7 @@ class Interactor:
                 self.logger.error(f"Unexpected error: {e}")
                 raise
 
+
     def interact(
         self,
         user_input: Optional[str],
@@ -808,11 +837,64 @@ class Interactor:
         markdown: bool = False,
         model: Optional[str] = None,
         output_callback: Optional[Callable[[str], None]] = None,
-        session_id: Optional[str] = None
-    ) -> Optional[str]:
-        """Main universal gateway for all LLM interaction."""
+        session_id: Optional[str] = None,
+        raw: Optional[bool] = None,
+        tool_suppress: bool = True,
+        timeout: float = 60.0
+    ) -> Union[Optional[str], "TokenStream"]:
+        """Main universal gateway for all LLM interaction.
+
+        This function serves as the single entry point for all interactions with the language model.
+        When `raw=False` (default), it handles the interaction internally and returns the full response.
+        When `raw=True`, it returns a context manager that yields chunks of the response for custom handling.
+
+        Args:
+            user_input: Text input from the user.
+            quiet: If True, don't print status info or progress.
+            tools: Enable (True) or disable (False) tool calling.
+            stream: Enable (True) or disable (False) streaming responses.
+            markdown: If True, renders content as markdown.
+            model: Optional model override.
+            output_callback: Optional callback to handle the output.
+            session_id: Optional session ID to load messages from.
+            raw: If True, return a context manager instead of handling the interaction internally.
+                 If None, use the class-level setting from __init__.
+            tool_suppress: If True and raw=True, filter out tool-related status messages.
+            timeout: Maximum time in seconds to wait for the stream to complete when raw=True.
+
+        Returns:
+            If raw=False: The complete response from the model as a string, or None if there was an error.
+            If raw=True: A context manager that yields chunks of the response as they arrive.
+
+        Example with default mode:
+            response = ai.interact("Tell me a joke")
+
+        Example with raw mode:
+            with ai.interact("Tell me a joke", raw=True) as stream:
+                for chunk in stream:
+                    print(chunk, end="", flush=True)
+        """
         if not user_input:
             return None
+
+        if quiet or self.quiet:
+            markdown = False
+            stream = False
+
+        # Determine if we should use raw mode
+        # If raw parameter is explicitly provided, use that; otherwise use class setting
+        use_raw = self.raw if raw is None else raw
+
+        # If raw mode is requested, delegate to interact_raw
+        if use_raw:
+            return self.interact_raw(
+                user_input=user_input,
+                tools=tools,
+                model=model,
+                session_id=session_id,
+                tool_suppress=tool_suppress,
+                timeout=timeout
+            )
 
         # Setup model if specified
         if model:
@@ -856,6 +938,184 @@ class Interactor:
         self._log(f"[INTERACTION] Completed with {len(self.history)} total messages")
 
         return result
+
+
+    def _interact_raw(
+        self,
+        user_input: Optional[str],
+        tools: bool = True,
+        model: Optional[str] = None,
+        session_id: Optional[str] = None,
+        tool_suppress: bool = True,
+        timeout: float = 60.0
+    ):
+        """
+        Low-level function that returns a raw stream of tokens from the model.
+        
+        This method works as a context manager that yields a generator of streaming tokens.
+        The caller is responsible for handling the output stream. Typically, this is used
+        indirectly through interact() with raw=True.
+        
+        Args:
+            user_input: Text input from the user.
+            tools: Enable (True) or disable (False) tool calling.
+            model: Optional model override.
+            session_id: Optional session ID to load messages from.
+            tool_suppress: If True, filter out tool-related status messages.
+            timeout: Maximum time in seconds to wait for the stream to complete.
+            
+        Returns:
+            A context manager that yields a stream of tokens.
+            
+        Example:
+            with ai.interact_raw("Hello world") as stream:
+                for chunk in stream:
+                    print(chunk, end="", flush=True)
+        """
+        if not user_input:
+            return None
+
+        # Setup model if specified
+        if model:
+            self._setup_client(model)
+            self._setup_encoding()
+        
+        # Session handling
+        if self.session_enabled and session_id:
+            self.session_id = session_id
+            self.session_load(session_id)
+        
+        # Add user message
+        self.messages_add(role="user", content=user_input)
+        
+        # Log token count estimate
+        token_count = self._count_tokens(self.history)
+        self._log(f"[STREAM] Estimated tokens in context: {token_count} / {self.context_length}")
+        
+        # Make sure we have enough context space
+        if token_count > self.context_length:
+            if self._cycle_messages():
+                self._log("[STREAM] Context window exceeded. Cannot proceed.", level="error")
+                return None
+        
+        # Log user input
+        self._log(f"[USER] {user_input}")
+        
+        # Create a token stream class using a thread-safe queue
+        class TokenStream:
+            def __init__(self, interactor, user_input, tools, tool_suppress, timeout):
+                self.interactor = interactor
+                self.user_input = user_input
+                self.tools = tools
+                self.tool_suppress = tool_suppress
+                self.timeout = timeout
+                self.token_queue = queue.Queue()
+                self.thread = None
+                self.result = None
+                self.error = None
+                self.completed = False
+                
+            def __enter__(self):
+                # Start the thread for async interaction
+                def stream_worker():
+                    # Define output callback to put tokens in queue
+                    def callback(text):
+                        # Filter out tool messages if requested
+                        if self.tool_suppress:
+                            try:
+                                # Check if this is a tool status message (JSON format)
+                                data = json.loads(text)
+                                if isinstance(data, dict) and data.get("type") == "tool_call":
+                                    # Skip this message
+                                    return
+                            except (json.JSONDecodeError, TypeError):
+                                # Not JSON or not a dict, continue normally
+                                pass
+
+                        # Add to queue
+                        self.token_queue.put(text)
+
+                    # Run the interaction in a new event loop
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                    try:
+                        # Run the interaction
+                        self.result = loop.run_until_complete(
+                            self.interactor._interact_async_core(
+                                user_input=self.user_input,
+                                quiet=True,
+                                tools=self.tools,
+                                stream=True,
+                                markdown=False,
+                                output_callback=callback
+                            )
+                        )
+                        # Signal successful completion
+                        self.completed = True
+                    except Exception as e:
+                        self.error = str(e)
+                        self.interactor.logger.error(f"Streaming error: {traceback.format_exc()}")
+                        # Add error information to the queue if we haven't yielded anything yet
+                        if self.token_queue.empty():
+                            self.token_queue.put(f"Error: {str(e)}")
+                    finally:
+                        # Signal end of stream regardless of success/failure
+                        self.token_queue.put(None)
+                        loop.close()
+
+                # Start the worker thread
+                self.thread = threading.Thread(target=stream_worker)
+                self.thread.daemon = True
+                self.thread.start()
+                
+                # Return self for iteration
+                return self
+            
+            def __iter__(self):
+                return self
+            
+            def __next__(self):
+                # Get next token from queue with timeout to prevent hanging
+                try:
+                    token = self.token_queue.get(timeout=self.timeout)
+                    if token is None:
+                        # End of stream
+                        raise StopIteration
+                    return token
+                except queue.Empty:
+                    # Timeout reached
+                    self.interactor.logger.warning(f"Stream timeout after {self.timeout}s")
+                    if not self.completed and not self.error:
+                        # Clean up the thread - it might be stuck
+                        if self.thread and self.thread.is_alive():
+                            # We can't forcibly terminate a thread in Python,
+                            # but we can report the issue
+                            self.interactor.logger.error("Stream worker thread is hung")
+                    raise StopIteration
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                # Clean up resources
+                if self.thread and self.thread.is_alive():
+                    self.thread.join(timeout=2.0)
+                    
+                # Add messages to history if successful
+                if self.completed and self.result and not exc_type:
+                    if isinstance(self.result, str) and self.result != "No response.":
+                        # If we had a successful completion, ensure the result is in the history
+                        last_msg = self.interactor.history[-1] if self.interactor.history else None
+                        if not last_msg or last_msg.get("role") != "assistant" or last_msg.get("content") != self.result:
+                            # Add a clean assistant message to history if not already there
+                            self.interactor.messages_add(role="assistant", content=self.result)
+                            
+                # If there was an error in the stream processing, log it
+                if self.error:
+                    self.interactor.logger.error(f"Stream processing error: {self.error}")
+                    
+                return False  # Don't suppress exceptions
+        
+        return TokenStream(self, user_input, tools, tool_suppress, timeout)
+
 
     async def _interact_async_core(
         self,
@@ -932,12 +1192,25 @@ class Interactor:
                         call_name = call["function"]["name"]
                         call_args = call["function"]["arguments"]
                         call_id = call["id"]
+
+                        # Stop Rich Live while executing tool calls 
+                        live_was_active = True
+                        if live and live.is_started:
+                            live_was_active = True
+                            live.stop()
                         
                         result = await self._handle_tool_call_async(
-                            call_name, call_args, call_id,
-                            {"model": self.model, "messages": self.history, "stream": stream},
-                            markdown, live, False, output_callback
+                            function_name=call_name,
+                            function_arguments=call_args,
+                            tool_call_id=call_id,
+                            quiet=quiet,
+                            safe=False,
+                            output_callback=output_callback
                         )
+
+                        # Restart live display if it was active before
+                        if live_was_active and live:
+                            live.start()
                         
                         # Add tool result message
                         tool_result_info = {
@@ -972,7 +1245,8 @@ class Interactor:
         if live:
             live.stop()
         
-        return full_content or "No response."
+        return full_content or None 
+
 
     async def _openai_runner(
         self,
@@ -1010,7 +1284,7 @@ class Interactor:
                 **params
             )
         except Exception as e:
-            self.logger.error(f"[OPENAI ERROR] {str(e)}")
+            self.logger.error(f"[OPENAI ERROR RUNNER]: {traceback.format_exc()}")
             raise
 
         assistant_content = ""
@@ -1030,7 +1304,7 @@ class Interactor:
                         output_callback(text)
                     elif live:
                         live.update(Markdown(assistant_content))
-                    elif not markdown and not quiet:
+                    elif not markdown:
                         print(text, end="")
 
                 # Process tool calls
@@ -1093,6 +1367,7 @@ class Interactor:
             "tool_calls": list(tool_calls_dict.values())
         }
 
+
     async def _anthropic_runner(
         self,
         *,
@@ -1120,32 +1395,44 @@ class Interactor:
         if self.tools_enabled and self.tools_supported:
             enabled_tools = []
             for tool in self._get_enabled_tools():
+                # Extract parameters from OpenAI format
+                tool_params = tool["function"]["parameters"]
+                
+                # Create Anthropic-compatible tool definition
                 format_tool = {
                     "name": tool["function"]["name"],
                     "description": tool["function"].get("description", ""),
-                    "input_schema": tool["function"]["parameters"],
+                    "input_schema": {
+                        "type": "object",
+                        "properties": tool_params.get("properties", {})
+                    }
                 }
+                
+                # Ensure 'required' is at the correct level for Anthropic (as a direct child of input_schema)
+                if "required" in tool_params:
+                    format_tool["input_schema"]["required"] = tool_params["required"]
+                    
                 enabled_tools.append(format_tool)
-
+            
             params["tools"] = enabled_tools
-
+        
         assistant_content = ""
         tool_calls_dict = {}
         
         try:
             # Process streaming response
             if stream:
+                stream_params = params.copy()
+                stream_params["stream"] = True
+                
                 stream_response = await self._retry_with_backoff(
                     self.async_client.messages.create,
-                    stream=True,
-                    **params
+                    **stream_params
                 )
                
                 content_type = None
                 async for chunk in stream_response:
-                    data = json.loads(chunk.to_json())
                     chunk_type = getattr(chunk, "type", "unknown")
-                    stop_reason = getattr(chunk, "stop_reason", None)
                     self._log(f"[ANTHROPIC CHUNK] Type: {chunk_type}", level="debug")
                     if chunk_type == "content_block_start" and hasattr(chunk.content_block, "type"):
                         content_type = chunk.content_block.type
@@ -1160,7 +1447,7 @@ class Interactor:
                                     "arguments": ""
                                 }
                             }
-                            self._log(f"[ANTHROPIC TOOL USE] Found complete tool use: {tool_name}", level="info")
+                            self._log(f"[ANTHROPIC TOOL USE] {tool_name}", level="debug")
                     
                     # Handle text content
                     if chunk_type == "content_block_delta" and hasattr(chunk.delta, "text"):
@@ -1170,7 +1457,7 @@ class Interactor:
                             output_callback(delta)
                         elif live:
                             live.update(Markdown(assistant_content))
-                        elif not markdown and not quiet:
+                        elif not markdown:
                             print(delta, end="")
 
                     # Handle complete tool use
@@ -1179,37 +1466,29 @@ class Interactor:
 
             # Process non-streaming response
             else:
+                # For non-streaming, ensure we don't send the stream parameter
+                non_stream_params = params.copy()
+                non_stream_params.pop("stream", None)  # Remove stream if it exists
+                
                 response = await self._retry_with_backoff(
                     self.async_client.messages.create,
-                    **params
+                    **non_stream_params
                 )
-                
+
                 # Extract text content
                 for content_block in response.content:
                     if content_block.type == "text":
                         assistant_content += content_block.text
-                
-                # Extract tool uses
-                tool_uses = getattr(response, "tool_uses", [])
-                if tool_uses:
-                    self._log(f"[ANTHROPIC TOOL USES] Found {len(tool_uses)} tool uses", level="debug")
-                    for i, tool_use in enumerate(tool_uses):
-                        # Extract and format the tool use
-                        tool_id = tool_use.id
-                        tool_name = tool_use.name
-                        tool_input = tool_use.input
-                        
-                        # Format the input as JSON string
-                        if isinstance(tool_input, dict):
-                            input_json = json.dumps(tool_input)
-                        else:
-                            input_json = json.dumps({}) if tool_input is None else str(tool_input)
-                        
+
+                    if content_block.type == "tool_use":
+                        tool_id = content_block.id
+                        tool_name = content_block.name
+                        tool_input = content_block.input
                         tool_calls_dict[tool_id] = {
                             "id": tool_id,
                             "function": {
                                 "name": tool_name,
-                                "arguments": input_json
+                                "arguments": tool_input
                             }
                         }
                         self._log(f"[ANTHROPIC TOOL USE] {tool_name}", level="debug")
@@ -1220,9 +1499,7 @@ class Interactor:
                     print(assistant_content)
                     
         except Exception as e:
-            self.logger.error(f"Error in Anthropic runner: {traceback.print_exc()}")
-            # Add more detailed logging
-            self._log(f"[ANTHROPIC ERROR] {traceback.format_exc()}", level="error")
+            self._log(f"[ANTHROPIC ERROR RUNNER] {traceback.format_exc()}", level="error")
             
             # Return something usable even in case of error
             return {
@@ -1237,7 +1514,6 @@ class Interactor:
         }
 
 
-
     def _get_enabled_tools(self) -> List[dict]:
         """Return the list of currently enabled tool function definitions."""
         return [
@@ -1245,14 +1521,13 @@ class Interactor:
             if not tool["function"].get("disabled", False)
         ]
 
+
     async def _handle_tool_call_async(
         self,
         function_name: str,
         function_arguments: str,
         tool_call_id: str,
-        params: dict,
-        markdown: bool,
-        live: Optional[Live],
+        quiet: bool = False,
         safe: bool = False,
         output_callback: Optional[Callable[[str], None]] = None
     ) -> str:
@@ -1263,8 +1538,6 @@ class Interactor:
             function_arguments: JSON string containing the function arguments.
             tool_call_id: Unique identifier for this tool call.
             params: Parameters used for the original API call.
-            markdown: If True, renders content as markdown.
-            live: Optional Live context for updating content in real-time.
             safe: If True, prompts for confirmation before executing the tool call.
             output_callback: Optional callback to handle the tool call result.
 
@@ -1274,26 +1547,21 @@ class Interactor:
         Raises:
             ValueError: If the function is not found or JSON is invalid.
         """
-        live_was_active = False
+        if isinstance(function_arguments, str):
+            arguments = json.loads(function_arguments)
+        else:
+            arguments = function_arguments
         
-        try:
-            arguments = json.loads(function_arguments or "{}")
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Invalid JSON in tool call arguments: {e}")
-            return {"error": "Invalid JSON format in tool call arguments."}
-
         self._log(f"[TOOL:{function_name}] args={arguments}")
 
         func = getattr(self, function_name, None)
         if not func:
             raise ValueError(f"Function '{function_name}' not found.")
 
-        # Properly handle live display if it's active
-        if live and live.is_started:
-            live_was_active = True
-            live.stop()
+        be_quiet = self.quiet if quiet is None else quiet 
 
-        print(f"\nRunning {function_name}...\n")
+        if not be_quiet:
+            print(f"\nRunning {function_name}...")
 
         if output_callback:
             notification = json.dumps({
@@ -1334,16 +1602,13 @@ class Interactor:
                 })
                 output_callback(notification)
 
-            # Restart live display if it was active before
-            if live_was_active and live:
-                live.start()
-
             return command_result
 
         except Exception as e:
             self._log(f"[ERROR] Tool execution failed: {e}", level="error")
             self.logger.error(f"Error executing tool function '{function_name}': {e}")
             return {"error": str(e)}
+
 
     def _setup_encoding(self):
         """Set up the token encoding based on the current model."""
@@ -1362,11 +1627,13 @@ class Interactor:
             self.logger.error(f"Failed to setup encoding: {e}")
             self.encoding = tiktoken.get_encoding("cl100k_base")
 
+
     def _estimate_tokens_tiktoken(self, messages) -> int:
         """Rough token count estimate using tiktoken for OpenAI or fallback cases."""
         if not hasattr(self, "encoding") or not self.encoding:
             self._setup_encoding()
         return sum(len(self.encoding.encode(msg.get("content", ""))) for msg in messages if isinstance(msg.get("content"), str))
+
 
     def _count_tokens(self, messages, use_cache=True) -> int:
         """Accurately estimate token count for messages including tool calls with caching support.
@@ -1555,6 +1822,7 @@ class Interactor:
             self._token_count_cache[cache_key] = num_tokens
         
         return num_tokens
+
 
     def _cycle_messages(self):
         """
@@ -1871,6 +2139,7 @@ class Interactor:
         
         return message_id
 
+
     def messages_system(self, prompt: str):
         """Set or retrieve the current system prompt."""
         if not isinstance(prompt, str) or not prompt:
@@ -1905,11 +2174,13 @@ class Interactor:
 
         return self.system
 
+
     def messages(self) -> list:
         """Return full session messages (persisted or in-memory)."""
         if self.session_enabled and self.session_id:
             return self.session.load_full(self.session_id).get("messages", [])
         return self.session_history
+
 
     def messages_length(self) -> int:
         """Calculate the total token count for the message history."""
@@ -1926,6 +2197,7 @@ class Interactor:
                         total_tokens += len(self.encoding.encode(tool_call["function"].get("name", "")))
                         total_tokens += len(self.encoding.encode(tool_call["function"].get("arguments", "")))
         return total_tokens
+
 
     def session_load(self, session_id: Optional[str]):
         """Load and normalize messages for a specific session."""
@@ -2008,6 +2280,7 @@ class Interactor:
             # Reset to empty state with system message
             self.session_reset()
 
+
     def session_reset(self):
         """
         Reset the current session state and reinitialize to default system prompt.
@@ -2031,6 +2304,7 @@ class Interactor:
             self.messages_add(role="system", content=self.system)
         
         self._log("[SESSION] Reset to in-memory mode")
+
 
     def _normalizer(self, force=False, new_message_only=False):
         """
@@ -2077,6 +2351,7 @@ class Interactor:
             # Fallback to a simple conversion for unknown SDKs
             for msg in self.session_history:
                 self._generic_normalize_message(msg)
+
 
     def _openai_normalizer(self):
         """
@@ -2143,6 +2418,7 @@ class Interactor:
                         "content": json.dumps(msg["content"]) if isinstance(msg["content"], (dict, list)) else msg["content"]
                     }
                     self.history.append(tool_msg)
+
 
     def _anthropic_normalizer(self):
         """
@@ -2240,6 +2516,7 @@ class Interactor:
                     }
                     self.history.append(tool_result_msg)
 
+
     def _openai_normalize_message(self, msg):
         """Normalize a single message to OpenAI format and add to history."""
         role = msg.get("role")
@@ -2311,28 +2588,29 @@ class Interactor:
                 }
                 self.history.append(tool_msg)
 
+
     def _anthropic_normalize_message(self, msg):
         """Normalize a single message to Anthropic format and add to history."""
         role = msg.get("role")
         content = msg.get("content")
-        
+
         if role == "system":
             # Store system prompt separately, not in history for Anthropic
             self.system = content
-            
+
         elif role == "user":
             # User messages - check if it contains tool results
             if "metadata" in msg and "tool_info" in msg["metadata"]:
                 tool_info = msg["metadata"]["tool_info"]
                 # Check for result or directly use content
                 result_content = tool_info.get("result", content)
-                
+
                 # Create Anthropic tool result format
                 try:
                     result_str = json.dumps(result_content) if isinstance(result_content, (dict, list)) else str(result_content)
                 except:
                     result_str = str(result_content)
-                    
+
                 tool_result_msg = {
                     "role": "user",
                     "content": [{
@@ -2348,23 +2626,23 @@ class Interactor:
                     "role": "user",
                     "content": content
                 })
-                
+
         elif role == "assistant":
             # For assistant messages, check for tool use
             if "metadata" in msg and "tool_info" in msg["metadata"]:
                 # This is an assistant message with tool use
                 tool_info = msg["metadata"]["tool_info"]
-                
+
                 # Build content blocks
                 content_blocks = []
-                
+
                 # Add text content if present
                 if content:
                     content_blocks.append({
                         "type": "text",
                         "text": content if isinstance(content, str) else ""
                     })
-                    
+
                 # Add tool use block - safely convert arguments
                 try:
                     # Parse arguments to ensure it's a dictionary
@@ -2377,14 +2655,14 @@ class Interactor:
                         args_dict = tool_info["arguments"]
                 except:
                     args_dict = {"error": "Failed to parse arguments"}
-                    
+
                 content_blocks.append({
                     "type": "tool_use",
                     "id": tool_info["id"],
                     "name": tool_info["name"],
                     "input": args_dict
                 })
-                
+
                 # Create Anthropic assistant message with tool use
                 self.history.append({
                     "role": "assistant",
@@ -2396,17 +2674,17 @@ class Interactor:
                     "role": "assistant",
                     "content": content
                 })
-                
+
         elif role == "tool":
             # Tool messages in standard format get converted to user messages with tool_result
             if "metadata" in msg and "tool_info" in msg["metadata"]:
                 tool_info = msg["metadata"]["tool_info"]
-                
+
                 try:
                     result_str = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
                 except:
                     result_str = str(content)
-                    
+
                 # Create Anthropic tool result message
                 tool_result_msg = {
                     "role": "user",
@@ -2418,6 +2696,7 @@ class Interactor:
                 }
                 self.history.append(tool_result_msg)
 
+
     def _generic_normalize_message(self, msg):
         """Generic normalizer for unknown SDKs."""
         role = msg.get("role")
@@ -2428,6 +2707,7 @@ class Interactor:
                 "role": role,
                 "content": content
             })
+
 
     def track_token_usage(self):
         """Track and return token usage across the conversation history.
@@ -2464,6 +2744,7 @@ class Interactor:
             "provider": self.provider,
             "model": self.model
         }
+
 
     def get_message_token_breakdown(self):
         """Analyze token usage by message type and provide a detailed breakdown.
@@ -2550,8 +2831,6 @@ def run_bash_command(command: str, safe_mode: bool = True) -> Dict[str, Any]:
         return {"status": "error", "error": "Command timed out."}
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
     
 
 def main():
