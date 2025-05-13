@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-13 15:59:44
+# Modified: 2025-05-13 17:21:09
 
 import os
 import re
@@ -927,7 +927,7 @@ class Interactor:
 
         # If raw mode is requested, delegate to interact_raw
         if use_raw:
-            return self.interact_raw(
+            return self._interact_raw(
                 user_input=user_input,
                 tools=tools,
                 model=model,
