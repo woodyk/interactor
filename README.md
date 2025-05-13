@@ -8,7 +8,7 @@ Built for testability, extensibility, and CLI or programmatic use.
 
 ## Features
 
-- Supports OpenAI, Ollama, NVIDIA, Google (Gemini) out-of-the-box
+- Supports OpenAI, Ollama, NVIDIA, Google (Gemini), Anthropic out-of-the-box
 - Streamed output with markdown rendering
 - Tool calling with auto-registration from Python functions
 - Token-aware message cycling (to respect context limits)
