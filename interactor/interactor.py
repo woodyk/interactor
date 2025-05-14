@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-13 17:21:09
+# Modified: 2025-05-14 00:12:38
 
 import os
 import re
@@ -137,13 +137,15 @@ class Interactor:
                 "base_url": "https://api.deepseek.com",
                 "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or None
             },
+        }
+        """
             "grok": {
                 "sdk": "grok",
                 "base_url": "https://api.x.ai/v1",
                 "api_key": api_key or os.getenv("GROK_API_KEY") or None
             }
         }
-
+        """
 
         # Console log handler (always enabled at WARNING+)
         if not self.logger.handlers:
