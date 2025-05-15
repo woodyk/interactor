@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-15 00:32:52
+# Modified: 2025-05-13 15:59:44
 
 import os
 import re
@@ -137,15 +137,13 @@ class Interactor:
                 "base_url": "https://api.deepseek.com",
                 "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or None
             },
-        }
-        """
             "grok": {
                 "sdk": "grok",
                 "base_url": "https://api.x.ai/v1",
                 "api_key": api_key or os.getenv("GROK_API_KEY") or None
             }
         }
-        """
+
 
         # Console log handler (always enabled at WARNING+)
         if not self.logger.handlers:
@@ -195,9 +193,6 @@ class Interactor:
         self.tools_enabled = self.tools_supported if tools is None else tools and self.tools_supported
         self._setup_encoding()
         self.messages_add(role="system", content=self.system)
-
-        # Populate list of available models
-        self.models = self._update_available_models()
 
 
     def _log(self, message: str, level: str = "info"):
@@ -754,12 +749,8 @@ class Interactor:
         """
         return self.tools
 
-    
-    def list_models(self):
-        """list available models"""
-        return self.models
 
-    def _update_available_models(
+    def list_models(
         self,
         providers: Optional[Union[str, List[str]]] = None,
         filter: Optional[str] = None
@@ -936,7 +927,7 @@ class Interactor:
 
         # If raw mode is requested, delegate to interact_raw
         if use_raw:
-            return self._interact_raw(
+            return self.interact_raw(
                 user_input=user_input,
                 tools=tools,
                 model=model,
