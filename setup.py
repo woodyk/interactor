@@ -5,7 +5,7 @@
 # Author: Ms. White 
 # Description: 
 # Created: 2025-05-12 15:19:57
-# Modified: 2025-05-15 00:10:34
+# Modified: 2025-05-17 00:02:09
 
 import os
 from setuptools import setup, find_packages
@@ -21,7 +21,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="ai-interactor",
-    version="0.1.2.2",
+    version="0.1.2.3",
     description="Universal AI interaction library with session and tool support",
     long_description=long_description,
     long_description_content_type="text/markdown",
