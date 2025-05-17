@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-15 00:32:52
+# Modified: 2025-05-17 00:01:17
 
 import os
 import re
@@ -74,6 +74,7 @@ class Interactor:
         max_retries: int = 3,
         retry_delay: float = 1.0,
         log_path: Optional[str] = None,
+        log_level: Optional[str] = "ERROR",
         raw: Optional[bool] = False,
         session_enabled: bool = False,
         session_id: Optional[str] = None,
@@ -99,8 +100,19 @@ class Interactor:
         self.system = "You are a helpful Assistant."
         self.raw = raw
         self.quiet = quiet
+
+        # Configure Logging
+        level_map = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+            "CRITICAL": logging.CRITICAL
+        }
+
         self.logger = logging.getLogger(f"InteractorLogger_{id(self)}")
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(level_map[log_level])
+
         self.providers = {
             "openai": {
                 "sdk": "openai",
@@ -196,8 +208,6 @@ class Interactor:
         self._setup_encoding()
         self.messages_add(role="system", content=self.system)
 
-        # Populate list of available models
-        self.models = self._update_available_models()
 
 
     def _log(self, message: str, level: str = "info"):
@@ -755,8 +765,11 @@ class Interactor:
         return self.tools
 
     
-    def list_models(self):
+    def list_models(self, update=False):
         """list available models"""
+        if update:
+            self._update_available_models()
+
         return self.models
 
     def _update_available_models(
@@ -822,7 +835,9 @@ class Interactor:
                     self.logger.warning(f"SDK '{sdk}' for provider '{provider_name}' is not supported by list_models()")
 
             except Exception as e:
-                self.logger.error(f"Failed to list models for {provider_name}: {e}")
+                self.logger.warning(f"Failed to list models for {provider_name}: {e}")
+
+        self.models = models
 
         return sorted(models, key=str.lower)
 
@@ -3134,7 +3149,7 @@ def main():
                 if user_input.lower() in {"/exit", "/quit"}:
                     break
                 if user_input.startswith("/list"):
-                    models = caller.list_models()
+                    models = caller.list_models(True)
                     print(models)
                     continue
                 elif not user_input:
