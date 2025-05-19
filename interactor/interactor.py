@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-05-17 00:01:17
+# Modified: 2025-05-17 00:37:59
 
 import os
 import re
@@ -100,6 +100,7 @@ class Interactor:
         self.system = "You are a helpful Assistant."
         self.raw = raw
         self.quiet = quiet
+        self.models = []
 
         # Configure Logging
         level_map = {
