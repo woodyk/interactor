@@ -8,7 +8,7 @@
 #              dynamic model switching, async support,
 #              and comprehensive error handling
 # Created: 2025-03-14 12:22:57
-# Modified: 2025-06-22 01:12:11
+# Modified: 2025-05-13 15:59:44
 
 import os
 import re
@@ -74,7 +74,6 @@ class Interactor:
         max_retries: int = 3,
         retry_delay: float = 1.0,
         log_path: Optional[str] = None,
-        log_level: Optional[str] = "ERROR",
         raw: Optional[bool] = False,
         session_enabled: bool = False,
         session_id: Optional[str] = None,
@@ -100,20 +99,8 @@ class Interactor:
         self.system = "You are a helpful Assistant."
         self.raw = raw
         self.quiet = quiet
-        self.models = []
-
-        # Configure Logging
-        level_map = {
-            "DEBUG": logging.DEBUG,
-            "INFO": logging.INFO,
-            "WARNING": logging.WARNING,
-            "ERROR": logging.ERROR,
-            "CRITICAL": logging.CRITICAL
-        }
-
         self.logger = logging.getLogger(f"InteractorLogger_{id(self)}")
-        self.logger.setLevel(level_map[log_level])
-
+        self.logger.setLevel(logging.DEBUG)
         self.providers = {
             "openai": {
                 "sdk": "openai",
@@ -150,15 +137,13 @@ class Interactor:
                 "base_url": "https://api.deepseek.com",
                 "api_key": api_key or os.getenv("DEEPSEEK_API_KEY") or None
             },
-        }
-        """
             "grok": {
                 "sdk": "grok",
                 "base_url": "https://api.x.ai/v1",
                 "api_key": api_key or os.getenv("GROK_API_KEY") or None
             }
         }
-        """
+
 
         # Console log handler (always enabled at WARNING+)
         if not self.logger.handlers:
@@ -208,7 +193,6 @@ class Interactor:
         self.tools_enabled = self.tools_supported if tools is None else tools and self.tools_supported
         self._setup_encoding()
         self.messages_add(role="system", content=self.system)
-
 
 
     def _log(self, message: str, level: str = "info"):
@@ -765,15 +749,8 @@ class Interactor:
         """
         return self.tools
 
-    
-    def list_models(self, update=False):
-        """list available models"""
-        if update:
-            self._update_available_models()
 
-        return self.models
-
-    def _update_available_models(
+    def list_models(
         self,
         providers: Optional[Union[str, List[str]]] = None,
         filter: Optional[str] = None
@@ -836,9 +813,7 @@ class Interactor:
                     self.logger.warning(f"SDK '{sdk}' for provider '{provider_name}' is not supported by list_models()")
 
             except Exception as e:
-                self.logger.warning(f"Failed to list models for {provider_name}: {e}")
-
-        self.models = models
+                self.logger.error(f"Failed to list models for {provider_name}: {e}")
 
         return sorted(models, key=str.lower)
 
@@ -952,7 +927,7 @@ class Interactor:
 
         # If raw mode is requested, delegate to interact_raw
         if use_raw:
-            return self._interact_raw(
+            return self.interact_raw(
                 user_input=user_input,
                 tools=tools,
                 model=model,
@@ -3150,7 +3125,7 @@ def main():
                 if user_input.lower() in {"/exit", "/quit"}:
                     break
                 if user_input.startswith("/list"):
-                    models = caller.list_models(True)
+                    models = caller.list_models()
                     print(models)
                     continue
                 elif not user_input:
